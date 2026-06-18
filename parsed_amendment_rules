@@ -1,0 +1,278 @@
+"""
+
+Intermediate Transform: Parsed Amendment Rules - FIXED WITH CORRECT SCHEMA
+
+Parses the Logic_JSON from amendment rules to create a structured, queryable dataset.
+Explodes the JSON structure into individual slot requirements.
+Handles both mandatory_slots and slot_groups structures.
+
+
+
+FIXED: Uses native Spark JSON functions instead of UDF for proper array handling.
+v15.1: Added slot_name normalization (removes ALL spaces)
+
+Input: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/amendment_rules_source
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules
+"""
+
+from transforms.api import Input, Output, transform
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType
+
+
+@transform(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
+    rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/amendment_rules_source"),
+)
+def compute(rules, output):
+    """
+    Parse Logic_JSON using NATIVE SPARK with CORRECT SCHEMA.
+
+    Handles TWO structures:
+    1. mandatory_slots (direct slot requirements)
+    2. slot_groups (grouped slots like CPU_COM/CPU_MON)
+    FIXED: Properly handle arrays in the slot structure.
+
+    v15.1 NORMALIZATION:
+    - Removes ALL spaces from slot_name (e.g., "PSM _CARD" → "PSM_CARD")
+    - Removes ALL spaces from group_name for consistency
+
+    This transform converts the hierarchical JSON structure into a flat table
+    where each row represents a slot requirement for a specific amendment.
+    """
+
+    df = rules.dataframe()
+
+    # Rename columns from CSV (capitals) to lowercase for consistency
+    df = df.select(
+        F.col("Unit").alias("unit"),
+        F.col("Rule_ID").alias("rule_id"),
+        F.col("Target_LRU_PN").alias("target_lru_pn"),
+        F.col("Amdt_Name").alias("amendment_name"),
+        F.col("Logic_JSON").alias("logic_json"),
+        F.col("Description").alias("description"),
+        F.col("Supersedes").alias("supersedes"),
+    )
+
+    # Add computed columns for supersedes and priority
+    df = df.withColumn(
+        "supersedes_raw",
+        F.when(F.col("supersedes").isNull(), F.lit("[]"))
+        .when(F.col("supersedes") == "", F.lit("[]"))
+        .when(F.col("supersedes") == "[]", F.lit("[]"))
+        .otherwise(F.col("supersedes")),
+    )
+
+    df = df.withColumn(
+        "supersedes_count",
+        F.when(F.col("supersedes_raw") == "[]", F.lit(0)).otherwise(F.size(F.split(F.col("supersedes"), ","))),
+    )
+
+    df = df.withColumn(
+        "amendment_priority",
+        F.when(F.col("amendment_name") == "STD", F.lit(0))
+        .when(F.col("amendment_name") == "A", F.lit(1))
+        .when(F.col("amendment_name") == "B", F.lit(2))
+        .when(F.col("amendment_name") == "C", F.lit(3))
+        .when(F.col("amendment_name") == "D", F.lit(4))
+        .when(F.col("amendment_name") == "E", F.lit(5))
+        .when(F.col("amendment_name") == "F", F.lit(6))
+        .when(F.col("amendment_name") == "G", F.lit(7))
+        .when(F.col("amendment_name") == "H", F.lit(8))
+        .otherwise(F.lit(99)),
+    )
+
+    # Define complete JSON schema matching your actual data
+    json_schema = StructType(
+        [
+            StructField("amendment", StringType(), True),
+            StructField("description", StringType(), True),
+            StructField("supersedes", ArrayType(StringType()), True),
+            StructField(
+                "rules",
+                ArrayType(
+                    StructType(
+                        [
+                            StructField("comment", StringType(), True),
+                            StructField(
+                                "context_check",
+                                StructType(
+                                    [
+                                        StructField("part_type", StringType(), True),
+                                        StructField("pn", StringType(), True),
+                                    ]
+                                ),
+                                True,
+                            ),
+                            StructField(
+                                "mandatory_slots",
+                                ArrayType(
+                                    StructType(
+                                        [
+                                            StructField("slot_name", StringType(), True),
+                                            StructField(
+                                                "allowed_pns",
+                                                ArrayType(StringType()),
+                                                True,
+                                            ),
+                                        ]
+                                    )
+                                ),
+                                True,
+                            ),
+                            StructField(
+                                "slot_groups",
+                                ArrayType(
+                                    StructType(
+                                        [
+                                            StructField("group_name", StringType(), True),
+                                            StructField(
+                                                "slots_included",
+                                                ArrayType(StringType()),
+                                                True,
+                                            ),
+                                            StructField(
+                                                "allowed_pns",
+                                                ArrayType(StringType()),
+                                                True,
+                                            ),
+                                            StructField("mix_policy", StringType(), True),
+                                        ]
+                                    )
+                                ),
+                                True,
+                            ),
+                        ]
+                    )
+                ),
+                True,
+            ),
+        ]
+    )
+
+    # Parse JSON (now using lowercase logic_json after rename)
+    df = df.withColumn("parsed_json", F.from_json(F.col("logic_json"), json_schema))
+
+    # Explode rules array
+    df = df.withColumn("rule", F.explode(F.col("parsed_json.rules")))
+
+    # ==========================================
+    # PART 1: Handle mandatory_slots
+    # ==========================================
+    df_mandatory = df.filter(F.col("rule.mandatory_slots").isNotNull())
+
+    if df_mandatory.count() > 0:
+        df_mandatory = df_mandatory.withColumn("slot", F.explode(F.col("rule.mandatory_slots")))
+
+        df_mandatory = df_mandatory.select(
+            "target_lru_pn",
+            "amendment_name",
+            "description",
+            "supersedes",
+            "supersedes_count",
+            "amendment_priority",
+            F.col("slot.slot_name").alias("slot_name"),
+            F.col("slot.allowed_pns").alias("allowed_pns"),
+            F.lit("mandatory").alias("slot_type"),
+            F.col("rule.context_check.part_type").alias("context_part_type"),
+            F.col("rule.context_check.pn").alias("context_pn"),
+            F.lit(None).cast(StringType()).alias("mix_policy"),
+            F.lit(None).cast(StringType()).alias("group_name"),
+            F.col("rule.comment").alias("rule_comment"),
+        )
+    else:
+        # Create empty dataframe with same schema
+        df_mandatory = (
+            df.limit(0)
+            .select(
+                "target_lru_pn",
+                "amendment_name",
+                "description",
+                "supersedes",
+                "supersedes_count",
+                "amendment_priority",
+            )
+            .withColumn("slot_name", F.lit(None).cast(StringType()))
+            .withColumn("allowed_pns", F.array().cast(ArrayType(StringType())))
+            .withColumn("slot_type", F.lit("mandatory"))
+            .withColumn("context_part_type", F.lit(None).cast(StringType()))
+            .withColumn("context_pn", F.lit(None).cast(StringType()))
+            .withColumn("mix_policy", F.lit(None).cast(StringType()))
+            .withColumn("group_name", F.lit(None).cast(StringType()))
+            .withColumn("rule_comment", F.lit(None).cast(StringType()))
+        )
+
+    # ==========================================
+    # PART 2: Handle slot_groups (for PSM_COM/PSM_MON cases)
+    # ==========================================
+    df_groups = df.filter(F.col("rule.slot_groups").isNotNull())
+
+    if df_groups.count() > 0:
+        df_groups = df_groups.withColumn("slot_group", F.explode(F.col("rule.slot_groups")))
+        df_groups = df_groups.withColumn("slot_name_exploded", F.explode(F.col("slot_group.slots_included")))
+
+        df_groups = df_groups.select(
+            "target_lru_pn",
+            "amendment_name",
+            "description",
+            "supersedes",
+            "supersedes_count",
+            "amendment_priority",
+            F.col("slot_name_exploded").alias("slot_name"),
+            F.col("slot_group.allowed_pns").alias("allowed_pns"),
+            F.lit("group").alias("slot_type"),
+            F.col("rule.context_check.part_type").alias("context_part_type"),
+            F.col("rule.context_check.pn").alias("context_pn"),
+            F.col("slot_group.mix_policy").alias("mix_policy"),
+            F.col("slot_group.group_name").alias("group_name"),
+            F.col("rule.comment").alias("rule_comment"),
+        )
+
+        # Union both parts
+        df_result = df_mandatory.union(df_groups)
+    else:
+        df_result = df_mandatory
+
+    # ==========================================
+    # v15.1 NORMALIZATION: Clean ALL spaces
+    # ==========================================
+    # Critical fixes:
+    # - "PSM _CARD" → "PSM_CARD"
+    # - "CARTE  CPU1" → "CARTECPU1" (if any)
+    # - " CPU1_CARD " → "CPU1_CARD" (trim + internal spaces)
+
+    df_result = df_result.withColumn("slot_name", F.regexp_replace(F.col("slot_name"), r"\s+", ""))
+
+    # Also clean group_name if present
+    df_result = df_result.withColumn(
+        "group_name",
+        F.when(F.col("group_name").isNotNull(), F.regexp_replace(F.col("group_name"), r"\s+", "")).otherwise(
+            F.col("group_name")
+        ),
+    )
+
+    # Create composite key (after normalization)
+    df_result = df_result.withColumn(
+        "slot_rule_key",
+        F.concat_ws("::", F.col("target_lru_pn"), F.col("amendment_name"), F.col("slot_name")),
+    )
+
+    # Add flag for context-dependent rules
+    df_result = df_result.withColumn(
+        "has_context",
+        F.col("context_part_type").isNotNull() | F.col("context_pn").isNotNull(),
+    )
+
+    # Add count of allowed PNs per slot
+    df_result = df_result.withColumn(
+        "allowed_pns_count",
+        F.when(F.col("allowed_pns").isNotNull(), F.size(F.col("allowed_pns"))).otherwise(0),
+    )
+
+    # Add first allowed PN for quick display
+    df_result = df_result.withColumn(
+        "first_allowed_pn",
+        F.when(F.col("allowed_pns_count") > 0, F.element_at(F.col("allowed_pns"), 1)).otherwise(None),
+    )
+
+    output.write_dataframe(df_result)
