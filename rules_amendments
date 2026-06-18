@@ -1,0 +1,89 @@
+"""
+Source: Rules Amendments
+
+Simple pass-through transform that enriches the external amendment_rules_source
+with computed fields for easier downstream processing.
+
+Input: amendment_rules_source (external dataset)
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/rules_amendments
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/rules_amendments"),
+    source=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/amendment_rules_source"),
+)
+def compute(source: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Enriches amendment rules source with computed fields.
+    
+    Adds:
+    - supersedes_count
+    - amendment_priority
+    - rule_key
+    """
+    
+    df = source.polars(lazy=True)
+    
+    # Normalize column names (handle both uppercase and lowercase)
+    # Check if columns are uppercase (Unit, Rule_ID, etc.) and rename
+    column_mapping = {
+        "Unit": "unit",
+        "Rule_ID": "rule_id",
+        "Target_LRU_PN": "target_lru_pn",
+        "Amdt_Name": "amendment_name",
+        "Warning_Text": "warning_text",
+        "Logic_JSON": "logic_json",
+        "Description": "description",
+        "Supersedes": "supersedes"
+    }
+    
+    # Rename columns that exist
+    existing_columns = df.collect_schema().names()
+    rename_dict = {old: new for old, new in column_mapping.items() if old in existing_columns}
+    
+    if rename_dict:
+        df = df.rename(rename_dict)
+    
+    # Add computed fields
+    df = df.with_columns([
+        # Supersedes count
+        pl.when(pl.col("supersedes").is_null() | (pl.col("supersedes") == "") | (pl.col("supersedes") == "[]"))
+        .then(pl.lit(0))
+        .otherwise(pl.col("supersedes").str.split(",").list.len())
+        .alias("supersedes_count"),
+        
+        # Amendment priority (STD=0, A=1, B=2, etc.)
+        pl.when(pl.col("amendment_name") == "STD")
+        .then(pl.lit(0))
+        .when(pl.col("amendment_name") == "A")
+        .then(pl.lit(1))
+        .when(pl.col("amendment_name") == "B")
+        .then(pl.lit(2))
+        .when(pl.col("amendment_name") == "C")
+        .then(pl.lit(3))
+        .when(pl.col("amendment_name") == "D")
+        .then(pl.lit(4))
+        .when(pl.col("amendment_name") == "E")
+        .then(pl.lit(5))
+        .when(pl.col("amendment_name") == "F")
+        .then(pl.lit(6))
+        .when(pl.col("amendment_name") == "G")
+        .then(pl.lit(7))
+        .when(pl.col("amendment_name") == "H")
+        .then(pl.lit(8))
+        .otherwise(pl.lit(99))
+        .alias("amendment_priority"),
+        
+        # Rule key (composite)
+        pl.concat_str([
+            pl.col("target_lru_pn"),
+            pl.lit("::"),
+            pl.col("amendment_name")
+        ]).alias("rule_key")
+    ])
+    
+    output.write_table(df)
