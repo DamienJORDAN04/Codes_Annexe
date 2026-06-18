@@ -1,0 +1,19 @@
+with tab1:
+    st.markdown("### Welcome to v15.2.2 - Real Stock Integration")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">1,806</div><div class="metric-label">Options</div></div>',
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">22</div><div class="metric-label">Slots</div></div>',
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            '<div class="metric-card"><div class="metric-value">v15.2.2</div><div class="metric-label">NEW</div></div>',
+            unsafe_allow_html=True,
+        )
+    st.success("✅ Real Stock Integration | ✅ LRU Names Display | ✅ Multiple Context PNs Support")
