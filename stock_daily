@@ -1,0 +1,132 @@
+"""
+Source Transform: Daily Stock Data - OPTIMIZED VERSION
+
+Reads the daily updated stock dataset and filters for NEUF and OCCA only.
+Takes the latest date available and aggregates by part_number.
+
+OPTIMIZATIONS:
+- Early filtering (date + storage_location) before aggregation
+- Read only necessary columns
+- Use broadcast join if applicable
+- Efficient aggregation strategy
+
+Input: ri.foundry.main.dataset.dc59d9f1-76b7-44d7-bcb8-14066f92f9af (stock_by_magasin_hist)
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily
+"""
+
+from pyspark.sql import functions as F
+from transforms.api import Input, Output, transform
+
+
+@transform(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily"
+    ),
+    stock_source=Input("ri.foundry.main.dataset.dc59d9f1-76b7-44d7-bcb8-14066f92f9af"),
+)
+def compute(stock_source, output):
+    """
+    OPTIMIZED: Process daily stock data efficiently
+
+    Performance improvements:
+    1. Read only necessary columns (column pruning)
+    2. Filter early (pushdown optimization)
+    3. Single aggregation pass
+    4. Efficient NEUF/OCCA split
+    """
+
+    # Read only necessary columns (column pruning for performance)
+    df = stock_source.dataframe().select(
+        "part_number", "storage_location", "TOTAL_STOCK", "date"
+    )
+
+    # OPTIMIZATION 1: Get latest date first (small operation)
+    latest_date_df = df.agg(F.max("date").alias("latest_date"))
+    latest_date = latest_date_df.collect()[0]["latest_date"]
+
+    # OPTIMIZATION 2: Filter EARLY (both date and storage_location)
+    # This dramatically reduces data volume before aggregation
+    df_filtered = df.filter(
+        (F.col("date") == F.lit(latest_date))
+        & (F.upper(F.col("storage_location")).isin(["NEUF", "OCCA"]))
+    )
+
+    # OPTIMIZATION 3: Single aggregation pass with conditional sums
+    df_pivoted = df_filtered.groupBy("part_number").agg(
+        # NEUF stock - conditional sum
+        F.sum(
+            F.when(
+                F.upper(F.col("storage_location")) == "NEUF", F.col("TOTAL_STOCK")
+            ).otherwise(0)
+        ).alias("stock_neuf_raw"),
+        # OCCA stock - conditional sum
+        F.sum(
+            F.when(
+                F.upper(F.col("storage_location")) == "OCCA", F.col("TOTAL_STOCK")
+            ).otherwise(0)
+        ).alias("stock_occa_raw"),
+        # Total stock
+        F.sum("TOTAL_STOCK").alias("stock_total_raw"),
+        # Latest date for this PN
+        F.max("date").alias("stock_date"),
+    )
+
+    # OPTIMIZATION 4: Clean and cast in one pass
+    df_pivoted = df_pivoted.select(
+        "part_number",
+        F.coalesce(F.col("stock_neuf_raw"), F.lit(0)).cast("int").alias("stock_neuf"),
+        F.coalesce(F.col("stock_occa_raw"), F.lit(0)).cast("int").alias("stock_occa"),
+        F.coalesce(F.col("stock_total_raw"), F.lit(0)).cast("int").alias("stock_total"),
+        "stock_date",
+    )
+
+    # OPTIMIZATION 5: Filter out 0 stock early (reduce data volume)
+    df_pivoted = df_pivoted.filter(F.col("stock_total") > 0)
+
+    # Add computed columns in batch
+    df_pivoted = (
+        df_pivoted
+        # Flags
+        .withColumn("has_stock_neuf", F.col("stock_neuf") > 0)
+        .withColumn("has_stock_occa", F.col("stock_occa") > 0)
+        .withColumn("has_stock", F.col("stock_total") > 0)
+        # Stock label (for UI display)
+        .withColumn(
+            "stock_label",
+            F.when(
+                F.col("stock_neuf") > 0,
+                F.concat(
+                    F.lit("✅ NEUF: "),
+                    F.col("stock_neuf").cast("string"),
+                    F.when(
+                        F.col("stock_occa") > 0,
+                        F.concat(
+                            F.lit(" | OCCA: "), F.col("stock_occa").cast("string")
+                        ),
+                    ).otherwise(F.lit("")),
+                ),
+            )
+            .when(
+                F.col("stock_occa") > 0,
+                F.concat(F.lit("🟡 OCCA only: "), F.col("stock_occa").cast("string")),
+            )
+            .otherwise(F.lit("❌ Out of stock")),
+        )
+        # Stock category (for sorting and filtering)
+        .withColumn(
+            "stock_category",
+            F.when(F.col("stock_neuf") > 10, F.lit("HIGH_NEUF"))
+            .when(F.col("stock_neuf").between(1, 10), F.lit("LOW_NEUF"))
+            .when(F.col("stock_occa") > 10, F.lit("HIGH_OCCA"))
+            .when(F.col("stock_occa").between(1, 10), F.lit("LOW_OCCA"))
+            .otherwise(F.lit("NO_STOCK")),
+        )
+    )
+
+    # OPTIMIZATION 6: Sort only at the end (on small dataset)
+    df_result = df_pivoted.orderBy(
+        F.col("stock_neuf").desc(), F.col("stock_occa").desc(), F.col("part_number")
+    )
+
+    # Write result
+    output.write_dataframe(df_result)
