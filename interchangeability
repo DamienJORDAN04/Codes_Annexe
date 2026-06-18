@@ -1,0 +1,177 @@
+"""
+Source Transform: Interchangeability Rules
+
+Reads and validates the Interchangeability dataset.
+This dataset defines which cards can replace which (Old_PN → New_PN) and their impact.
+
+MIGRATION FROM CODE WORKBOOK:
+This transform now includes the logic previously in Code Workbook:
+1. Add Verdict_Type column (CASE logic)
+2. Join with Avionics Parts to get Display_Name
+3. Rename Display_Name to New_PN_Label
+
+Input: Database_application_Damien - DATA_INTERCHANGEABILITY (1) [CLEAN CSV]
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability"),
+    source=Input("ri.foundry.main.dataset.85b0d042-fc3a-4e26-a610-243009e9c75b"),
+    avionics_parts=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"),
+)
+def compute(source: LightweightInput, avionics_parts: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Clean and validate Interchangeability rules.
+
+    Transformations:
+    - Drop untitled_column_* (from CSV import)
+    - Filter valid swaps (Old_PN and New_PN not null)
+    - Standardize column names
+    - Add Verdict_Type (migrated from Code Workbook CASE logic)
+    - Join with Avionics Parts to get New_PN_Label
+    - Parse Swap_Logic_JSON
+    - Add flags for quick filtering
+    """
+    df = source.polars(lazy=True)
+
+    # Filter: Only keep valid swap rules
+    df = df.filter(pl.col("Old_PN").is_not_null() & pl.col("New_PN").is_not_null())
+
+    # === MIGRATION FROM CODE WORKBOOK: Add Verdict_Type ===
+    # Original Contour logic:
+    # CASE
+    #   WHEN Swap_Logic_JSON LIKE '%STD%' THEN 'STANDARD'
+    #   WHEN Swap_Logic_JSON LIKE '%amdt%' OR Swap_Logic_JSON LIKE '%or%' THEN 'AMENDMENT'
+    #   ELSE 'UNKNOWN'
+    # END
+
+    df = df.with_columns(
+        [
+            pl.when(pl.col("Swap_Logic_JSON").str.contains("STD"))
+            .then(pl.lit("STANDARD"))
+            .when(pl.col("Swap_Logic_JSON").str.contains("amdt") | pl.col("Swap_Logic_JSON").str.contains("or"))
+            .then(pl.lit("AMENDMENT"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("Verdict_Type")
+        ]
+    )
+
+    # === MIGRATION FROM CODE WORKBOOK: Join with Avionics Parts ===
+    # Original Contour logic: Join on New_PN = part_number to get display_name
+
+    df_parts = avionics_parts.polars(lazy=True)
+
+    # Debug: Check what columns are available
+    print(f"DEBUG: Avionics parts columns: {df_parts.collect_schema().names()}")
+
+    # Select only needed columns from avionics_parts
+    # Use .filter first to ensure we're working with valid data
+    df_parts_subset = df_parts.select(
+        [
+            pl.col("part_number"),
+            pl.col("display_name").alias("new_pn_label_temp"),  # Temporary name to avoid conflicts
+        ]
+    )
+
+    # Left join to preserve all interchangeability records
+    df = df.join(df_parts_subset, left_on="New_PN", right_on="part_number", how="left")
+
+    # Rename the joined column
+    df = df.with_columns([pl.col("new_pn_label_temp").alias("New_PN_Label")]).drop("new_pn_label_temp")
+
+    # Rename columns for consistency
+    df = df.rename(
+        {
+            "Verdict_Type": "verdict_type",
+            "Unit": "unit",
+            "Old_PN": "old_pn",
+            "New_PN": "new_pn",
+            "Applicable_LRU_PN": "applicable_lru_pn",
+            "Designation": "designation",
+            "Swap_Logic_JSON": "swap_logic_json",
+            "Comment": "comment",
+            "Applicable_amendment": "amendment_letter",  # Updated from screenshot
+            "Entire_Comments": "entire_description",  # Updated from screenshot
+            "All_Supersedes": "all_supersedes",
+            "New_PN_Label": "new_pn_label",
+        }
+    )
+
+    # 🧹 CLEAN: Strip whitespace from text columns (especially designation)
+    df = df.with_columns(
+        [
+            pl.col("designation").str.strip_chars().alias("designation"),
+            pl.col("old_pn").str.strip_chars().alias("old_pn"),
+            pl.col("new_pn").str.strip_chars().alias("new_pn"),
+            pl.col("applicable_lru_pn").str.strip_chars().alias("applicable_lru_pn"),
+        ]
+    )
+
+    # Create composite keys for fast lookup
+    df = df.with_columns(
+        [
+            # Key 1: "OLD_PN::NEW_PN::LRU_PN"
+            (pl.col("old_pn") + "::" + pl.col("new_pn") + "::" + pl.col("applicable_lru_pn").fill_null("ANY")).alias(
+                "swap_key"
+            ),
+            # Key 2: "NEW_PN::LRU_PN" (for reverse search: which LRUs accept this card)
+            (pl.col("new_pn") + "::" + pl.col("applicable_lru_pn").fill_null("ANY")).alias("card_lru_key"),
+        ]
+    )
+
+    # Parse swap logic to extract quick flags
+    df = df.with_columns(
+        [
+            # Flag: Is this a "standard" swap (no amendment impact)?
+            pl.col("swap_logic_json").str.contains('"req": "STD"').fill_null(False).alias("is_standard_swap"),
+            # Flag: Does this swap force a single amendment?
+            pl.col("swap_logic_json").str.contains('"amdt"').fill_null(False).alias("forces_single_amendment"),
+            # Flag: Does this swap force multiple amendment options (OR logic)?
+            pl.col("swap_logic_json").str.contains('"or"').fill_null(False).alias("forces_multi_option_amendment"),
+            # Visual status mapping
+            pl.when(pl.col("verdict_type") == "STANDARD")
+            .then(pl.lit("🟢 STANDARD"))
+            .when(pl.col("verdict_type") == "AMENDEMENT")
+            .then(pl.lit("🟠 AMENDMENT"))
+            .otherwise(pl.lit("⚪ NEUTRAL"))
+            .alias("visual_status"),
+        ]
+    )
+
+    # Extract amendment options for OR logic
+    df = df.with_columns(
+        [
+            # Extract amendments from {"or": ["N", "O"]}
+            pl.when(pl.col("forces_multi_option_amendment"))
+            .then(
+                # Parse JSON and extract the array
+                pl.col("swap_logic_json")
+                .str.extract(r'"or":\s*\[([^\]]+)\]', 1)
+                .str.replace_all('"', "")
+                .str.replace_all("'", "")
+                .str.strip_chars()
+            )
+            .otherwise(None)
+            .alias("amendment_options_raw")
+        ]
+    )
+
+    # Add impact categorization
+    df = df.with_columns(
+        [
+            pl.when(pl.col("is_standard_swap"))
+            .then(pl.lit("NO_AMENDMENT"))
+            .when(pl.col("forces_single_amendment"))
+            .then(pl.lit("FORCES_SINGLE_AMENDMENT"))
+            .when(pl.col("forces_multi_option_amendment"))
+            .then(pl.lit("FORCES_MULTI_OPTION_AMENDMENT"))
+            .otherwise(pl.lit("NEUTRAL"))
+            .alias("impact_category")
+        ]
+    )
+
+    output.write_table(df)
