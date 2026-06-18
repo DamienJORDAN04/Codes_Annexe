@@ -1,0 +1,1113 @@
+with tab2:
+    st.markdown("### 🔧 Equipment Search v15.2.7")
+
+    # ✅ INIT SESSION STATE FIRST
+    if "selected_card_pn_v2" not in st.session_state:
+        st.session_state.selected_card_pn_v2 = None
+    if "selected_lru_pn_v2" not in st.session_state:
+        st.session_state.selected_lru_pn_v2 = None
+
+    search_term = st.text_input(
+        "🔍 Enter Part Number:", placeholder="e.g., 0271112380, LA1E01003H36100", key="search_input"
+    )
+
+    if search_term:
+        with st.spinner("⏳ Loading datasets..."):
+            df_sru = load_sru_search()
+            df_slots = load_slot_options()
+            df_amendment_rules = load_amendment_rules()
+            df_amendment_conditions = load_amendment_conditions()
+            df_lru_stock = load_lru_stock_with_names()  # ✅ v15.2.0: Load LRU stock with names
+
+        if df_lru_stock is not None and not df_lru_stock.empty:
+            # ✅ v15.2.7: Check if searched PN is an LRU
+            searched_pn_is_lru = is_lru(search_term, df_lru_stock)
+
+            if searched_pn_is_lru:
+                # ==========================================
+                # LRU INTERCHANGEABILITY WORKFLOW
+                # ==========================================
+                st.success(f"✅ LRU found: `{search_term}`")
+
+                # ✅ v15.2.7: Display legal warning banner
+                st.warning(
+                    "⚠️ **The customer is solely responsible for verifying LRU interchangeability, "
+                    "as Airbus Avionics assumes no liability for the final aircraft configuration.**"
+                )
+
+                st.markdown("---")
+                st.markdown("### 🔄 LRU Interchangeability")
+
+                # Get interchangeable LRUs
+                interchangeable_lrus = get_interchangeable_lrus(search_term, df_lru_stock)
+
+                if len(interchangeable_lrus) > 0:
+                    # Get unit name from first LRU (all have same unit)
+                    unit_name = interchangeable_lrus[0]["unit"]
+
+                    st.info(f"**{len(interchangeable_lrus)} interchangeable LRU(s) found** for unit: **{unit_name}**")
+
+                    st.markdown("---")
+
+                    # Display each LRU with enhanced formatting
+                    for lru_info in interchangeable_lrus:
+                        lru_pn = lru_info["lru_pn"]
+                        stock_neuf = lru_info["stock_neuf"]
+                        stock_occa = lru_info["stock_occa"]
+                        stock_total = lru_info["stock_total"]
+                        in_production = lru_info["pn_in_production"].lower() == "yes"
+
+                        # Format: Bold PN if in production, current PN indicator
+                        is_current = lru_pn == search_term
+                        current_indicator = "👉 " if is_current else ""
+
+                        # ✅ Enhanced formatting: Larger text + Bold PN if in production
+                        if in_production:
+                            st.markdown(
+                                f'<div style="font-size:18px">'
+                                f"{current_indicator}`{lru_pn}` - "
+                                f"NEUF: {stock_neuf} | OCCA: {stock_occa} | Total: {stock_total}"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<div style="font-size:16px">'
+                                f"{current_indicator}`{lru_pn}` - "
+                                f"NEUF: {stock_neuf} | OCCA: {stock_occa} | Total: {stock_total}"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.info("ℹ️ No other interchangeable LRU found for this unit.")
+
+            else:
+                # ==========================================
+                # SRU (CARD) WORKFLOW - COMPORTEMENT ACTUEL
+                # ==========================================
+                if df_sru is not None and not df_sru.empty and df_slots is not None and not df_slots.empty:
+                    mask = df_sru["new_pn"].str.contains(search_term, case=False, na=False)
+                    results = df_sru[mask]
+
+                    if not results.empty:
+                        st.success(f"📊 {len(results)} result(s) found")
+
+                        # ==========================================
+                        # ANALYSE DIRECTE: Prendre la première carte trouvée
+                        # ==========================================
+                        first_result = results.iloc[0]
+                        selected_pn = first_result["new_pn"]
+
+                        st.markdown("---")
+                        st.markdown(f"## 🔍 Analysis for: `{selected_pn}`")
+
+                        # ✅ v15.2.0: Pass df_lru_stock to get LRU names and stock
+                        compatible_lrus = get_compatible_lrus_for_pn(selected_pn, df_slots, df_lru_stock)
+
+                        if compatible_lrus:
+                            st.markdown("### 📦 Compatible LRUs")
+
+                            for lru_idx, lru_info in enumerate(compatible_lrus):
+                                lru_pn = lru_info["lru_pn"]
+                                slot_name = lru_info["slot_name"]
+
+                                is_lru_selected = st.session_state.selected_lru_pn_v2 == lru_pn
+
+                                col1, col2, col3 = st.columns([1, 4, 3])
+
+                                with col1:
+                                    if st.button(
+                                        "✓" if is_lru_selected else "Select",
+                                        key=f"lru_sel_{lru_idx}",
+                                        type="primary" if is_lru_selected else "secondary",
+                                    ):
+                                        if is_lru_selected:
+                                            st.session_state.selected_lru_pn_v2 = None
+                                        else:
+                                            st.session_state.selected_lru_pn_v2 = lru_pn
+                                        st.rerun()
+
+                                with col2:
+                                    # ✅ v15.2.0: Display LRU name + PN
+                                    unit = lru_info.get("unit", "Unknown LRU")
+                                    st.markdown(f"**{unit}** (`{lru_pn}`) - Slot: {slot_name}")
+
+                                with col3:
+                                    # ✅ v15.2.0: Display real LRU stock
+                                    lru_stock_summary = lru_info.get("lru_stock_summary", "❌ No stock data")
+                                    st.caption(lru_stock_summary)
+
+                            # ==========================================
+                            # STEP 3: Detailed Analysis for Selected LRU
+                            # ==========================================
+                            if st.session_state.selected_lru_pn_v2:
+                                selected_lru = st.session_state.selected_lru_pn_v2
+
+                                selected_lru_info = next(
+                                    (lru for lru in compatible_lrus if lru["lru_pn"] == selected_lru), None
+                                )
+
+                                if selected_lru_info:
+                                    slot_name = selected_lru_info["slot_name"]
+
+                                    st.markdown("---")
+                                    st.markdown(
+                                        f"### 🎯 Configuration Analysis: `{selected_pn}` in LRU `{selected_lru}`"
+                                    )
+
+                                    amendment_info = get_amendment_for_card_in_lru(
+                                        selected_pn, selected_lru, slot_name, df_slots, df_amendment_rules
+                                    )
+
+                                    if amendment_info:
+                                        amendment = amendment_info["amendment"]
+                                        is_full = amendment_info["is_full_interchangeable"]
+                                        mandatory_count = amendment_info["mandatory_slots_count"]
+                                        mandatory_slots = amendment_info["mandatory_slots"]
+
+                                        # ✅ v15.2.8: Get ALL amendments for the selected card
+                                        card_info_all_amdts = df_slots[
+                                            (df_slots["applicable_lru_pn"] == selected_lru)
+                                            & (df_slots["new_pn"] == selected_pn)
+                                        ]
+
+                                        all_amendments_display = "STD"
+                                        if not card_info_all_amdts.empty:
+                                            card_row_all = card_info_all_amdts.iloc[0]
+                                            card_amdt_letter_all = card_row_all.get("amendment_letter", "")
+                                            card_all_amdts_list = parse_amendment_letter(card_amdt_letter_all)
+
+                                            if card_all_amdts_list:
+                                                all_amendments_display = ", ".join(card_all_amdts_list)
+                                            else:
+                                                all_amendments_display = "STD"
+
+                                        st.markdown("#### 🎯 Amendment Impact")
+
+                                        col_amdt, col_interch = st.columns(2)
+
+                                        with col_amdt:
+                                            if all_amendments_display == "STD":
+                                                st.markdown(
+                                                    '<div class="blue-banner">📌 Amendment Required: STD (Standard)</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+                                            else:
+                                                st.markdown(
+                                                    f'<div class="blue-banner">📌 Amendment Required: {all_amendments_display}</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+
+                                        with col_interch:
+                                            if is_full:
+                                                st.markdown(
+                                                    '<div class="green-banner">✅ Full Interchangeable with the same PN<br>⚠️ If replacing the card with a different PN, please verify the conditions.</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+                                            else:
+                                                st.markdown(
+                                                    f'<div class="orange-banner">⚠️ Conditional<br>Must also change {mandatory_count} slot(s)</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+
+                                        # ✅ v15.2.8: NEW - Expander for detailed conditions
+                                        # Get all amendments for the selected card
+                                        card_info_for_expander = df_slots[
+                                            (df_slots["applicable_lru_pn"] == selected_lru)
+                                            & (df_slots["new_pn"] == selected_pn)
+                                        ]
+
+                                        if not card_info_for_expander.empty:
+                                            card_row_expander = card_info_for_expander.iloc[0]
+                                            card_amdt_letter_expander = card_row_expander.get("amendment_letter", "")
+                                            card_all_amdts_expander = parse_amendment_letter(card_amdt_letter_expander)
+
+                                            # Check if card has multiple amendments
+                                            if len(card_all_amdts_expander) > 1:
+                                                # Multi-amendment card: show dropdown inside expander
+                                                with st.expander("📋 View Detailed Conditions", expanded=False):
+                                                    st.info(
+                                                        f"This card supports {len(card_all_amdts_expander)} amendments: {', '.join(card_all_amdts_expander)}"
+                                                    )
+
+                                                    # Dropdown to select amendment
+                                                    selected_amdt_expander = st.selectbox(
+                                                        "Select amendment to view conditions:",
+                                                        card_all_amdts_expander,
+                                                        key=f"expander_amdt_select_{selected_pn}_{selected_lru}",
+                                                    )
+
+                                                    # Get mandatory slots for selected amendment
+                                                    mandatory_slots_expander = get_mandatory_slots_from_parsed_rules(
+                                                        selected_lru, selected_amdt_expander, df_amendment_rules
+                                                    )
+
+                                                    if mandatory_slots_expander:
+                                                        st.markdown(
+                                                            f"**📋 Conditions for Amendment `{selected_amdt_expander}`:**"
+                                                        )
+                                                        st.markdown("Must also change:")
+
+                                                        for mslot in mandatory_slots_expander:
+                                                            mslot_name = mslot["slot_name"]
+                                                            allowed_pns = mslot.get("allowed_pns", [])
+
+                                                            st.markdown(f"**{mslot_name}:**")
+
+                                                            if allowed_pns and isinstance(allowed_pns, list):
+                                                                card_details_list = []
+
+                                                                for pn in allowed_pns:
+                                                                    card_details = df_slots[
+                                                                        (df_slots["applicable_lru_pn"] == selected_lru)
+                                                                        & (df_slots["new_pn"] == pn)
+                                                                        & (df_slots["physical_slot_name"] == mslot_name)
+                                                                    ]
+
+                                                                    if not card_details.empty:
+                                                                        detail_row = card_details.iloc[0]
+
+                                                                        designation = detail_row.get(
+                                                                            "designation", "N/A"
+                                                                        )
+                                                                        if pd.isna(designation) or not designation:
+                                                                            designation = "N/A"
+
+                                                                        pn_amdt_letter = detail_row.get(
+                                                                            "amendment_letter", ""
+                                                                        )
+                                                                        pn_amdts = parse_amendment_letter(
+                                                                            pn_amdt_letter
+                                                                        )
+                                                                        pn_amdt_display = (
+                                                                            ", ".join(pn_amdts) if pn_amdts else "STD"
+                                                                        )
+
+                                                                        pn_in_production = (
+                                                                            str(
+                                                                                detail_row.get("pn_in_production", "No")
+                                                                            ).lower()
+                                                                            == "yes"
+                                                                        )
+
+                                                                        stock_neuf = (
+                                                                            int(detail_row.get("stock_neuf", 0))
+                                                                            if pd.notna(detail_row.get("stock_neuf"))
+                                                                            else 0
+                                                                        )
+                                                                        stock_occa = (
+                                                                            int(detail_row.get("stock_occa", 0))
+                                                                            if pd.notna(detail_row.get("stock_occa"))
+                                                                            else 0
+                                                                        )
+
+                                                                        stock_total = stock_neuf + stock_occa
+
+                                                                        card_details_list.append(
+                                                                            {
+                                                                                "pn": pn,
+                                                                                "designation": designation,
+                                                                                "amendment": pn_amdt_display,
+                                                                                "pn_in_production": pn_in_production,
+                                                                                "stock_neuf": stock_neuf,
+                                                                                "stock_occa": stock_occa,
+                                                                                "stock_total": stock_total,
+                                                                            }
+                                                                        )
+                                                                    else:
+                                                                        card_details_list.append(
+                                                                            {
+                                                                                "pn": pn,
+                                                                                "designation": "No data",
+                                                                                "amendment": "N/A",
+                                                                                "pn_in_production": False,
+                                                                                "stock_neuf": 0,
+                                                                                "stock_occa": 0,
+                                                                                "stock_total": 0,
+                                                                            }
+                                                                        )
+
+                                                                # Sort: In Production first, then by stock DESC, then by PN ASC
+                                                                card_details_list.sort(
+                                                                    key=lambda x: (
+                                                                        0 if x["pn_in_production"] else 1,
+                                                                        -x["stock_total"],
+                                                                        x["pn"],
+                                                                    )
+                                                                )
+
+                                                                # Display with enhanced format
+                                                                for card_detail in card_details_list:
+                                                                    if card_detail["pn_in_production"]:
+                                                                        st.markdown(
+                                                                            f"• **{card_detail['designation']}** - `{card_detail['pn']}` "
+                                                                            f"[Amd: {card_detail['amendment']}] - "
+                                                                            f"NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                        )
+                                                                    else:
+                                                                        st.markdown(
+                                                                            f"• {card_detail['designation']} - `{card_detail['pn']}` "
+                                                                            f"[Amd: {card_detail['amendment']}] - "
+                                                                            f"NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                        )
+                                                            else:
+                                                                st.caption("No allowed PNs specified")
+                                                    else:
+                                                        st.info(
+                                                            f"✅ No additional conditions for amendment {selected_amdt_expander}"
+                                                        )
+
+                                                    # Description for selected amendment
+                                                    st.markdown("---")
+                                                    st.markdown("**📝 Description:**")
+                                                    description_expander = get_amendment_description_from_rules(
+                                                        selected_lru, selected_amdt_expander, df_amendment_rules
+                                                    )
+                                                    if description_expander:
+                                                        st.info(description_expander)
+                                                    else:
+                                                        st.caption("No description available for this amendment")
+
+                                            elif len(card_all_amdts_expander) == 1:
+                                                # Single amendment card
+                                                single_amdt = card_all_amdts_expander[0]
+
+                                                with st.expander(
+                                                    f"📋 Conditions for Amendment {single_amdt}", expanded=False
+                                                ):
+                                                    if mandatory_slots:
+                                                        st.markdown(f"Must also change:")
+
+                                                        for mslot in mandatory_slots:
+                                                            mslot_name = mslot["slot_name"]
+                                                            allowed_pns = mslot.get("allowed_pns", [])
+
+                                                            st.markdown(f"**{mslot_name}:**")
+
+                                                            if allowed_pns and isinstance(allowed_pns, list):
+                                                                card_details_list = []
+
+                                                                for pn in allowed_pns:
+                                                                    card_details = df_slots[
+                                                                        (df_slots["applicable_lru_pn"] == selected_lru)
+                                                                        & (df_slots["new_pn"] == pn)
+                                                                        & (df_slots["physical_slot_name"] == mslot_name)
+                                                                    ]
+
+                                                                    if not card_details.empty:
+                                                                        detail_row = card_details.iloc[0]
+
+                                                                        designation = detail_row.get(
+                                                                            "designation", "N/A"
+                                                                        )
+                                                                        if pd.isna(designation) or not designation:
+                                                                            designation = "N/A"
+
+                                                                        pn_amdt_letter = detail_row.get(
+                                                                            "amendment_letter", ""
+                                                                        )
+                                                                        pn_amdts = parse_amendment_letter(
+                                                                            pn_amdt_letter
+                                                                        )
+                                                                        pn_amdt_display = (
+                                                                            ", ".join(pn_amdts) if pn_amdts else "STD"
+                                                                        )
+
+                                                                        pn_in_production = (
+                                                                            str(
+                                                                                detail_row.get("pn_in_production", "No")
+                                                                            ).lower()
+                                                                            == "yes"
+                                                                        )
+
+                                                                        stock_neuf = (
+                                                                            int(detail_row.get("stock_neuf", 0))
+                                                                            if pd.notna(detail_row.get("stock_neuf"))
+                                                                            else 0
+                                                                        )
+                                                                        stock_occa = (
+                                                                            int(detail_row.get("stock_occa", 0))
+                                                                            if pd.notna(detail_row.get("stock_occa"))
+                                                                            else 0
+                                                                        )
+
+                                                                        stock_total = stock_neuf + stock_occa
+
+                                                                        card_details_list.append(
+                                                                            {
+                                                                                "pn": pn,
+                                                                                "designation": designation,
+                                                                                "amendment": pn_amdt_display,
+                                                                                "pn_in_production": pn_in_production,
+                                                                                "stock_neuf": stock_neuf,
+                                                                                "stock_occa": stock_occa,
+                                                                                "stock_total": stock_total,
+                                                                            }
+                                                                        )
+                                                                    else:
+                                                                        card_details_list.append(
+                                                                            {
+                                                                                "pn": pn,
+                                                                                "designation": "No data",
+                                                                                "amendment": "N/A",
+                                                                                "pn_in_production": False,
+                                                                                "stock_neuf": 0,
+                                                                                "stock_occa": 0,
+                                                                                "stock_total": 0,
+                                                                            }
+                                                                        )
+
+                                                                # Sort: In Production first, then by stock DESC, then by PN ASC
+                                                                card_details_list.sort(
+                                                                    key=lambda x: (
+                                                                        0 if x["pn_in_production"] else 1,
+                                                                        -x["stock_total"],
+                                                                        x["pn"],
+                                                                    )
+                                                                )
+
+                                                                # Display with enhanced format
+                                                                for card_detail in card_details_list:
+                                                                    if card_detail["pn_in_production"]:
+                                                                        st.markdown(
+                                                                            f"• **{card_detail['designation']}** - `{card_detail['pn']}` "
+                                                                            f"[Amd: {card_detail['amendment']}] - "
+                                                                            f"NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                        )
+                                                                    else:
+                                                                        st.markdown(
+                                                                            f"• {card_detail['designation']} - `{card_detail['pn']}` "
+                                                                            f"[Amd: {card_detail['amendment']}] - "
+                                                                            f"NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                        )
+                                                            else:
+                                                                st.caption("No allowed PNs specified")
+                                                    else:
+                                                        st.info(
+                                                            f"✅ No additional conditions for amendment {single_amdt}"
+                                                        )
+
+                                                    # Description
+                                                    st.markdown("---")
+                                                    st.markdown("**📝 Description:**")
+                                                    description_single = get_amendment_description_from_rules(
+                                                        selected_lru, single_amdt, df_amendment_rules
+                                                    )
+                                                    if description_single:
+                                                        st.info(description_single)
+                                                    else:
+                                                        st.caption("No description available for this amendment")
+                                            else:
+                                                # STD or no amendment - show expander for STD
+                                                with st.expander("📋 Conditions for Amendment STD", expanded=False):
+                                                    st.info("✅ STD (Standard) - No additional conditions required")
+
+                                        st.markdown("---")
+                                        st.markdown(f"#### 🔄 Other Cards for Slot `{slot_name}`")
+
+                                        other_cards = get_other_cards_in_slot(selected_lru, slot_name, df_slots)
+
+                                        if not other_cards.empty:
+                                            st.info(
+                                                f"**{len(other_cards)} card(s) available** for this slot (sorted: production → stock)"
+                                            )
+
+                                            for _, card_row in other_cards.iterrows():
+                                                card_pn = card_row["new_pn"]
+                                                is_current = card_pn == selected_pn
+                                                in_production = (
+                                                    str(card_row.get("pn_in_production", "No")).lower() == "yes"
+                                                )
+
+                                                stock_neuf = int(card_row.get("stock_neuf", 0))
+                                                stock_occa = int(card_row.get("stock_occa", 0))
+
+                                                card_amdt_letter = card_row.get("amendment_letter", "")
+                                                card_amdts = parse_amendment_letter(card_amdt_letter)
+                                                card_amdt = card_amdts[0] if card_amdts else "STD"
+
+                                                card_amendment_info = get_amendment_for_card_in_lru(
+                                                    card_pn, selected_lru, slot_name, df_slots, df_amendment_rules
+                                                )
+
+                                                card_is_full = True
+                                                card_mandatory_count = 0
+                                                if card_amendment_info:
+                                                    card_is_full = card_amendment_info["is_full_interchangeable"]
+                                                    card_mandatory_count = card_amendment_info["mandatory_slots_count"]
+
+                                                current_indicator = "👉 " if is_current else ""
+
+                                                if in_production:
+                                                    label_text = f"{current_indicator}**{card_pn}** - Stock: NEUF {stock_neuf} | OCCA {stock_occa}"
+                                                else:
+                                                    label_text = f"{current_indicator}{card_pn} - Stock: NEUF {stock_neuf} | OCCA {stock_occa}"
+
+                                                with st.expander(label_text, expanded=False):
+                                                    if in_production:
+                                                        st.markdown(
+                                                            '<div style="background-color:#ffd700;padding:5px;border-radius:3px;text-align:center">⭐ IN PRODUCTION</div>',
+                                                            unsafe_allow_html=True,
+                                                        )
+
+                                                    col1, col2 = st.columns(2)
+
+                                                    with col1:
+                                                        st.markdown(f"**Stock:**")
+                                                        st.markdown(f"- NEUF: {stock_neuf}")
+                                                        st.markdown(f"- OCCA: {stock_occa}")
+                                                        st.markdown(f"- Total: {stock_neuf + stock_occa}")
+
+                                                    with col2:
+                                                        # ✅ v15.2.6: Display ALL amendments for the card
+                                                        card_all_amdts = parse_amendment_letter(card_amdt_letter)
+                                                        amendment_display = (
+                                                            ", ".join(card_all_amdts) if card_all_amdts else "STD"
+                                                        )
+                                                        st.markdown(f"**Amendment:** `{amendment_display}`")
+
+                                                        # ✅ v15.2.6: Check if interchangeability varies by amendment
+                                                        if len(card_all_amdts) > 1:
+                                                            # Check Full/Conditional status for each amendment
+                                                            statuses = []
+                                                            for amdt in card_all_amdts:
+                                                                amdt_info = get_amendment_for_card_in_lru(
+                                                                    card_pn,
+                                                                    selected_lru,
+                                                                    slot_name,
+                                                                    df_slots,
+                                                                    df_amendment_rules,
+                                                                )
+                                                                if amdt_info:
+                                                                    # Get mandatory slots for this specific amendment
+                                                                    amdt_mandatory = (
+                                                                        get_mandatory_slots_from_parsed_rules(
+                                                                            selected_lru, amdt, df_amendment_rules
+                                                                        )
+                                                                    )
+
+                                                                    # Determine if Full or Conditional for this amendment
+                                                                    if not amdt_mandatory:
+                                                                        statuses.append(True)  # Full
+                                                                    elif (
+                                                                        len(amdt_mandatory) == 1
+                                                                        and amdt_mandatory[0]["slot_name"] == slot_name
+                                                                    ):
+                                                                        statuses.append(True)  # Full (only itself)
+                                                                    else:
+                                                                        statuses.append(False)  # Conditional
+
+                                                            # Check if statuses differ
+                                                            if statuses and len(set(statuses)) > 1:
+                                                                st.warning(
+                                                                    "⚠️ **Interchangeability depends on amendment**"
+                                                                )
+                                                            elif statuses and all(statuses):
+                                                                st.success("✅ **Full Interchangeable**")
+                                                            elif statuses and not any(statuses):
+                                                                st.warning(f"⚠️ **Conditional** (varies by amendment)")
+                                                            else:
+                                                                # Fallback to original logic
+                                                                if card_is_full:
+                                                                    st.success("✅ **Full Interchangeable**")
+                                                                else:
+                                                                    st.warning(
+                                                                        f"⚠️ **Conditional** ({card_mandatory_count} slot(s))"
+                                                                    )
+                                                        else:
+                                                            # Single amendment - display as before
+                                                            if card_is_full:
+                                                                st.success("✅ **Full Interchangeable**")
+                                                            else:
+                                                                st.warning(
+                                                                    f"⚠️ **Conditional** ({card_mandatory_count} slot(s))"
+                                                                )
+
+                                                    if not card_is_full and card_amendment_info:
+                                                        st.markdown("---")
+
+                                                        # ✅ v15.2.5: Check if card has multiple amendments
+                                                        card_all_amdts = parse_amendment_letter(card_amdt_letter)
+
+                                                        if len(card_all_amdts) > 1:
+                                                            st.markdown("**📋 Conditions (Multi-Amendment):**")
+                                                            st.info(
+                                                                f"This card supports {len(card_all_amdts)} amendments: {', '.join(card_all_amdts)}"
+                                                            )
+
+                                                            # Dropdown to select which amendment to display conditions for
+                                                            selected_amdt_for_conditions = st.selectbox(
+                                                                "Select amendment to view conditions:",
+                                                                card_all_amdts,
+                                                                key=f"amdt_conditions_{card_pn}_{slot_name}",
+                                                            )
+
+                                                            # Get amendment info for selected amendment
+                                                            selected_amdt_info = get_amendment_for_card_in_lru(
+                                                                card_pn,
+                                                                selected_lru,
+                                                                slot_name,
+                                                                df_slots,
+                                                                df_amendment_rules,
+                                                            )
+
+                                                            # Override amendment to show conditions for selected one
+                                                            if selected_amdt_info:
+                                                                # Get mandatory slots for the selected amendment
+                                                                mandatory_slots_for_selected = (
+                                                                    get_mandatory_slots_from_parsed_rules(
+                                                                        selected_lru,
+                                                                        selected_amdt_for_conditions,
+                                                                        df_amendment_rules,
+                                                                    )
+                                                                )
+
+                                                                if mandatory_slots_for_selected:
+                                                                    st.markdown(
+                                                                        f"**Conditions for Amendment `{selected_amdt_for_conditions}`:**"
+                                                                    )
+
+                                                                    for mslot in mandatory_slots_for_selected:
+                                                                        mslot_name = mslot["slot_name"]
+                                                                        allowed_pns = mslot.get("allowed_pns", [])
+
+                                                                        st.markdown(f"**{mslot_name}:**")
+
+                                                                        if allowed_pns and isinstance(
+                                                                            allowed_pns, list
+                                                                        ):
+                                                                            card_details_list = []
+
+                                                                            for pn in allowed_pns:
+                                                                                card_details = df_slots[
+                                                                                    (
+                                                                                        df_slots["applicable_lru_pn"]
+                                                                                        == selected_lru
+                                                                                    )
+                                                                                    & (df_slots["new_pn"] == pn)
+                                                                                    & (
+                                                                                        df_slots["physical_slot_name"]
+                                                                                        == mslot_name
+                                                                                    )
+                                                                                ]
+
+                                                                                if not card_details.empty:
+                                                                                    detail_row = card_details.iloc[0]
+
+                                                                                    designation = detail_row.get(
+                                                                                        "designation", "N/A"
+                                                                                    )
+                                                                                    if (
+                                                                                        pd.isna(designation)
+                                                                                        or not designation
+                                                                                    ):
+                                                                                        designation = "N/A"
+
+                                                                                    # Get all amendments for this PN
+                                                                                    pn_amdt_letter = detail_row.get(
+                                                                                        "amendment_letter", ""
+                                                                                    )
+                                                                                    pn_amdts = parse_amendment_letter(
+                                                                                        pn_amdt_letter
+                                                                                    )
+                                                                                    pn_amdt_display = (
+                                                                                        ", ".join(pn_amdts)
+                                                                                        if pn_amdts
+                                                                                        else "STD"
+                                                                                    )
+
+                                                                                    pn_in_production = (
+                                                                                        str(
+                                                                                            detail_row.get(
+                                                                                                "pn_in_production", "No"
+                                                                                            )
+                                                                                        ).lower()
+                                                                                        == "yes"
+                                                                                    )
+
+                                                                                    stock_neuf = (
+                                                                                        int(
+                                                                                            detail_row.get(
+                                                                                                "stock_neuf", 0
+                                                                                            )
+                                                                                        )
+                                                                                        if pd.notna(
+                                                                                            detail_row.get("stock_neuf")
+                                                                                        )
+                                                                                        else 0
+                                                                                    )
+                                                                                    stock_occa = (
+                                                                                        int(
+                                                                                            detail_row.get(
+                                                                                                "stock_occa", 0
+                                                                                            )
+                                                                                        )
+                                                                                        if pd.notna(
+                                                                                            detail_row.get("stock_occa")
+                                                                                        )
+                                                                                        else 0
+                                                                                    )
+
+                                                                                    stock_total = (
+                                                                                        stock_neuf + stock_occa
+                                                                                    )
+
+                                                                                    card_details_list.append(
+                                                                                        {
+                                                                                            "pn": pn,
+                                                                                            "designation": designation,
+                                                                                            "amendment": pn_amdt_display,
+                                                                                            "pn_in_production": pn_in_production,
+                                                                                            "stock_neuf": stock_neuf,
+                                                                                            "stock_occa": stock_occa,
+                                                                                            "stock_total": stock_total,
+                                                                                        }
+                                                                                    )
+                                                                                else:
+                                                                                    card_details_list.append(
+                                                                                        {
+                                                                                            "pn": pn,
+                                                                                            "designation": "No data",
+                                                                                            "amendment": "N/A",
+                                                                                            "pn_in_production": False,
+                                                                                            "stock_neuf": 0,
+                                                                                            "stock_occa": 0,
+                                                                                            "stock_total": 0,
+                                                                                        }
+                                                                                    )
+
+                                                                            # Sort: In Production first, then by stock DESC, then by PN ASC
+                                                                            card_details_list.sort(
+                                                                                key=lambda x: (
+                                                                                    0 if x["pn_in_production"] else 1,
+                                                                                    -x["stock_total"],
+                                                                                    x["pn"],
+                                                                                )
+                                                                            )
+
+                                                                            # Display with enhanced format
+                                                                            for card_detail in card_details_list:
+                                                                                if card_detail["pn_in_production"]:
+                                                                                    st.markdown(
+                                                                                        f"• **{card_detail['designation']}** - `{card_detail['pn']}` [Amd: {card_detail['amendment']}] - NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                                    )
+                                                                                else:
+                                                                                    st.markdown(
+                                                                                        f"• {card_detail['designation']} - `{card_detail['pn']}` [Amd: {card_detail['amendment']}] - NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                                    )
+                                                                        else:
+                                                                            st.caption("No allowed PNs specified")
+                                                                else:
+                                                                    st.info(
+                                                                        f"No mandatory slots for amendment {selected_amdt_for_conditions}"
+                                                                    )
+
+                                                            # ✅ v15.2.6: Display description for selected amendment from parsed_amendment_rules
+                                                            st.markdown("---")
+                                                            st.markdown("**📝 Description:**")
+                                                            st.markdown(
+                                                                f"**Description for Amendment `{selected_amdt_for_conditions}`:**"
+                                                            )
+                                                            description = get_amendment_description_from_rules(
+                                                                selected_lru,
+                                                                selected_amdt_for_conditions,
+                                                                df_amendment_rules,
+                                                            )
+                                                            if description:
+                                                                st.info(description)
+                                                            else:
+                                                                st.caption(
+                                                                    "No description available for this amendment"
+                                                                )
+                                                        else:
+                                                            # Single amendment - display as before
+                                                            st.markdown("**📋 Conditions:**")
+                                                            mandatory_slots = card_amendment_info["mandatory_slots"]
+
+                                                            if mandatory_slots:
+                                                                st.markdown(f"Must also change:")
+
+                                                                for mslot in mandatory_slots:
+                                                                    mslot_name = mslot["slot_name"]
+                                                                    allowed_pns = mslot.get("allowed_pns", [])
+
+                                                                    st.markdown(f"**{mslot_name}:**")
+
+                                                                    if allowed_pns and isinstance(allowed_pns, list):
+                                                                        card_details_list = []
+
+                                                                        for pn in allowed_pns:
+                                                                            card_details = df_slots[
+                                                                                (
+                                                                                    df_slots["applicable_lru_pn"]
+                                                                                    == selected_lru
+                                                                                )
+                                                                                & (df_slots["new_pn"] == pn)
+                                                                                & (
+                                                                                    df_slots["physical_slot_name"]
+                                                                                    == mslot_name
+                                                                                )
+                                                                            ]
+
+                                                                            if not card_details.empty:
+                                                                                detail_row = card_details.iloc[0]
+
+                                                                                designation = detail_row.get(
+                                                                                    "designation", "N/A"
+                                                                                )
+                                                                                if (
+                                                                                    pd.isna(designation)
+                                                                                    or not designation
+                                                                                ):
+                                                                                    designation = "N/A"
+
+                                                                                # Get all amendments for this PN
+                                                                                pn_amdt_letter = detail_row.get(
+                                                                                    "amendment_letter", ""
+                                                                                )
+                                                                                pn_amdts = parse_amendment_letter(
+                                                                                    pn_amdt_letter
+                                                                                )
+                                                                                pn_amdt_display = (
+                                                                                    ", ".join(pn_amdts)
+                                                                                    if pn_amdts
+                                                                                    else "STD"
+                                                                                )
+
+                                                                                pn_in_production = (
+                                                                                    str(
+                                                                                        detail_row.get(
+                                                                                            "pn_in_production", "No"
+                                                                                        )
+                                                                                    ).lower()
+                                                                                    == "yes"
+                                                                                )
+
+                                                                                stock_neuf = (
+                                                                                    int(detail_row.get("stock_neuf", 0))
+                                                                                    if pd.notna(
+                                                                                        detail_row.get("stock_neuf")
+                                                                                    )
+                                                                                    else 0
+                                                                                )
+                                                                                stock_occa = (
+                                                                                    int(detail_row.get("stock_occa", 0))
+                                                                                    if pd.notna(
+                                                                                        detail_row.get("stock_occa")
+                                                                                    )
+                                                                                    else 0
+                                                                                )
+
+                                                                                stock_total = stock_neuf + stock_occa
+
+                                                                                card_details_list.append(
+                                                                                    {
+                                                                                        "pn": pn,
+                                                                                        "designation": designation,
+                                                                                        "amendment": pn_amdt_display,
+                                                                                        "pn_in_production": pn_in_production,
+                                                                                        "stock_neuf": stock_neuf,
+                                                                                        "stock_occa": stock_occa,
+                                                                                        "stock_total": stock_total,
+                                                                                    }
+                                                                                )
+                                                                            else:
+                                                                                card_details_list.append(
+                                                                                    {
+                                                                                        "pn": pn,
+                                                                                        "designation": "No data",
+                                                                                        "amendment": "N/A",
+                                                                                        "pn_in_production": False,
+                                                                                        "stock_neuf": 0,
+                                                                                        "stock_occa": 0,
+                                                                                        "stock_total": 0,
+                                                                                    }
+                                                                                )
+
+                                                                        # Sort: In Production first, then by stock DESC, then by PN ASC
+                                                                        card_details_list.sort(
+                                                                            key=lambda x: (
+                                                                                0 if x["pn_in_production"] else 1,
+                                                                                -x["stock_total"],
+                                                                                x["pn"],
+                                                                            )
+                                                                        )
+
+                                                                        # Display with enhanced format
+                                                                        for card_detail in card_details_list:
+                                                                            if card_detail["pn_in_production"]:
+                                                                                st.markdown(
+                                                                                    f"• **{card_detail['designation']}** - `{card_detail['pn']}` [Amd: {card_detail['amendment']}] - NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                                )
+                                                                            else:
+                                                                                st.markdown(
+                                                                                    f"• {card_detail['designation']} - `{card_detail['pn']}` [Amd: {card_detail['amendment']}] - NEUF: {card_detail['stock_neuf']} | OCCA: {card_detail['stock_occa']}"
+                                                                                )
+                                                                    else:
+                                                                        st.caption("No allowed PNs specified")
+
+                                                            # ✅ v15.2.6: Display description for single amendment from parsed_amendment_rules
+                                                            st.markdown("---")
+                                                            st.markdown("**📝 Description:**")
+                                                            description = get_amendment_description_from_rules(
+                                                                selected_lru, card_amdt, df_amendment_rules
+                                                            )
+                                                            if description:
+                                                                st.info(description)
+                                                            else:
+                                                                st.caption(
+                                                                    "No description available for this amendment"
+                                                                )
+
+                                        st.markdown("---")
+
+                                        # ✅ v15.2.6: Different behavior for BLC/BMC vs other cards
+                                        if slot_name in ["BLC", "BMC"]:
+                                            st.markdown("#### 🏗️ Next Higher Assembly (NHA) - Level 1 (WIRED_ASSY)")
+                                            # For BLC/BMC: Filter by selected LRU to show only WIRED_ASSY in this LRU
+                                            nhas_level_1 = get_nha_level_1(
+                                                selected_pn,
+                                                slot_name,
+                                                df_slots,
+                                                lru_pn=selected_lru,
+                                                df_lru_stock=df_lru_stock,
+                                            )
+                                        else:
+                                            st.markdown("#### 🏗️ Compatible LRUs")
+                                            # For other cards: Show ALL LRUs where this card can be installed
+                                            nhas_level_1 = get_nha_level_1(
+                                                selected_pn, slot_name, df_slots, lru_pn=None, df_lru_stock=df_lru_stock
+                                            )
+
+                                        if nhas_level_1:
+                                            for nha in nhas_level_1:
+                                                nha_pn = nha["nha_pn"]
+                                                nha_name = nha.get("nha_name", "Unknown")
+                                                nha_in_production = str(nha["pn_in_production"]).lower() == "yes"
+                                                nha_stock_neuf = nha["stock_neuf"]
+                                                nha_stock_occa = nha["stock_occa"]
+
+                                                # ✅ v15.2.0: Display with LRU name if available
+                                                if nha_name and nha_name != "Unknown":
+                                                    display_text = f"{nha_name} ({nha_pn})"
+                                                else:
+                                                    display_text = nha_pn
+
+                                                if nha_in_production:
+                                                    st.markdown(
+                                                        f'<div style="font-size:16px">• <b>{display_text}</b> - NEUF: {nha_stock_neuf} | OCCA: {nha_stock_occa}</div>',
+                                                        unsafe_allow_html=True,
+                                                    )
+                                                else:
+                                                    st.markdown(
+                                                        f"• {display_text} - NEUF: {nha_stock_neuf} | OCCA: {nha_stock_occa}"
+                                                    )
+
+                                            # ✅ v15.2.4 FIX: NHA Level 2 for BLC/BMC - Display ALL LRUs where the card can be installed
+                                            if slot_name in ["BLC", "BMC"]:
+                                                st.markdown("---")
+                                                st.markdown("#### 🏗️ Next Higher Assembly (NHA) - Level 2 (LRU)")
+
+                                                # ✅ v15.2.4: Get ALL LRUs where this card can be installed (no LRU filter)
+                                                all_compatible_lrus = df_slots[
+                                                    (df_slots["new_pn"] == selected_pn)
+                                                    & (df_slots["physical_slot_name"] == slot_name)
+                                                ]
+
+                                                # Collect all unique LRU PNs
+                                                all_nhas_level_2 = []
+                                                seen_lru_pns = set()
+
+                                                for _, card_row in all_compatible_lrus.iterrows():
+                                                    lru_pn_found = card_row.get("applicable_lru_pn")
+
+                                                    if (
+                                                        lru_pn_found
+                                                        and pd.notna(lru_pn_found)
+                                                        and lru_pn_found not in seen_lru_pns
+                                                    ):
+                                                        seen_lru_pns.add(lru_pn_found)
+
+                                                        # Get LRU info
+                                                        nha_name = None
+                                                        pn_in_production = "No"
+                                                        stock_neuf = 0
+                                                        stock_occa = 0
+
+                                                        if df_lru_stock is not None and not df_lru_stock.empty:
+                                                            if lru_pn_found in df_lru_stock.index:
+                                                                lru_row = df_lru_stock.loc[lru_pn_found]
+                                                                if isinstance(lru_row, pd.DataFrame):
+                                                                    lru_row = lru_row.iloc[0]
+                                                                nha_name = str(lru_row.get("unit", "Unknown"))
+                                                                pn_in_production = str(
+                                                                    lru_row.get("pn_in_production", "No")
+                                                                )
+                                                                stock_neuf = (
+                                                                    int(lru_row.get("stock_neuf", 0))
+                                                                    if pd.notna(lru_row.get("stock_neuf"))
+                                                                    else 0
+                                                                )
+                                                                stock_occa = (
+                                                                    int(lru_row.get("stock_occa", 0))
+                                                                    if pd.notna(lru_row.get("stock_occa"))
+                                                                    else 0
+                                                                )
+
+                                                        if nha_name is None:
+                                                            nha_name = "Unknown"
+
+                                                        all_nhas_level_2.append(
+                                                            {
+                                                                "nha_pn": lru_pn_found,
+                                                                "nha_name": nha_name,
+                                                                "pn_in_production": pn_in_production,
+                                                                "stock_neuf": stock_neuf,
+                                                                "stock_occa": stock_occa,
+                                                            }
+                                                        )
+
+                                                # Sort by production status, stock total, PN
+                                                all_nhas_level_2.sort(
+                                                    key=lambda x: (
+                                                        0 if x["pn_in_production"].lower() == "yes" else 1,
+                                                        -(x["stock_neuf"] + x["stock_occa"]),
+                                                        x["nha_pn"],
+                                                    )
+                                                )
+
+                                                if all_nhas_level_2:
+                                                    for nha in all_nhas_level_2:
+                                                        nha_pn = nha["nha_pn"]
+                                                        nha_name = nha.get("nha_name", "Unknown")
+                                                        nha_in_production = (
+                                                            str(nha["pn_in_production"]).lower() == "yes"
+                                                        )
+                                                        nha_stock_neuf = nha["stock_neuf"]
+                                                        nha_stock_occa = nha["stock_occa"]
+
+                                                        if nha_in_production:
+                                                            st.markdown(
+                                                                f'<div style="font-size:16px">• <b>{nha_name} ({nha_pn})</b> - NEUF: {nha_stock_neuf} | OCCA: {nha_stock_occa}</div>',
+                                                                unsafe_allow_html=True,
+                                                            )
+                                                        else:
+                                                            st.markdown(
+                                                                f"• {nha_name} ({nha_pn}) - NEUF: {nha_stock_neuf} | OCCA: {nha_stock_occa}"
+                                                            )
+                                                else:
+                                                    st.info("No NHA Level 2 data available")
+                                        else:
+                                            st.info("No NHA Level 1 data available")
+                                    else:
+                                        st.error("❌ Could not retrieve amendment information for this card")
+                        else:
+                            st.warning("No compatible LRUs found for this card")
+                    else:
+                        st.warning(f"No results found for '{search_term}'")
+                else:
+                    st.error("❌ Failed to load required datasets. Please check your connection.")
+        else:
+            st.error("❌ Failed to load LRU stock data. Please check your connection.")
+    else:
+        st.info("👆 Enter a Part Number to search")
