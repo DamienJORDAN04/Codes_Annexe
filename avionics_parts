@@ -1,0 +1,166 @@
+"""
+Source Transform: Avionics Parts Catalog
+
+Reads the Avionics Part Source dataset and enriches it with real daily stock data.
+Replaces simulated stock with actual NEUF and OCCA stock levels.
+
+Inputs:
+  - ri.foundry.main.dataset.aa7370c0-b646-44f8-87a0-e72127e47df6 (Avionics_Part_Source)
+  - stock_daily (Daily stock with NEUF/OCCA)
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"
+    ),
+    parts_source=Input("ri.foundry.main.dataset.aa7370c0-b646-44f8-87a0-e72127e47df6"),
+    stock_daily=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily"
+    ),
+)
+def compute(
+    parts_source: LightweightInput,
+    stock_daily: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Clean and enrich the parts catalog with real stock data.
+
+    Transformations:
+    - Standardize column names (snake_case)
+    - Join with daily stock data (NEUF + OCCA)
+    - Replace simulated stock with real stock
+    - Filter parts with no stock if needed
+    - Add computed flags
+    """
+
+    df = parts_source.polars(lazy=True)
+    df_stock = stock_daily.polars(lazy=True)
+
+    # Standardize column names
+    df = df.rename(
+        {
+            "Stock_Simulated": "stock_simulated_old",
+            "Display_Name": "display_name",
+            "Unit": "unit",
+            "Designation": "designation",
+            "ModuleType": "module_type",
+            "PN": "part_number",
+            "InService": "in_service",
+            "Procurable": "procurable",
+            "Repairable": "repairable",
+            "Scrap": "scrap",
+            "PNinProduction": "pn_in_production",
+            "NHA_CompatibilityList": "nha_compatibility_list",
+            "Comments": "comments",
+        }
+    )
+
+    # Join with stock data (LEFT JOIN to keep all parts)
+    df = df.join(
+        df_stock.select(
+            [
+                "part_number",
+                "stock_neuf",
+                "stock_occa",
+                "stock_total",
+                "has_stock_neuf",
+                "has_stock_occa",
+                "has_stock",
+                "stock_label",
+                "stock_category",
+                "stock_date",
+            ]
+        ),
+        on="part_number",
+        how="left",
+    )
+
+    # Fill nulls for parts not in stock dataset
+    df = df.with_columns(
+        [
+            pl.col("stock_neuf").fill_null(0),
+            pl.col("stock_occa").fill_null(0),
+            pl.col("stock_total").fill_null(0),
+            pl.col("has_stock_neuf").fill_null(False),
+            pl.col("has_stock_occa").fill_null(False),
+            pl.col("has_stock").fill_null(False),
+            pl.col("stock_label").fill_null("❌ No stock data"),
+            pl.col("stock_category").fill_null("NO_STOCK"),
+        ]
+    )
+
+    # Add computed columns
+    df = df.with_columns(
+        [
+            # Is part available? (In service + has stock)
+            ((pl.col("in_service") == "Yes") & (pl.col("stock_total") > 0)).alias(
+                "is_available"
+            ),
+            # Preferred stock type (NEUF preferred over OCCA)
+            pl.when(pl.col("stock_neuf") > 0)
+            .then(pl.lit("NEUF"))
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.lit("OCCA"))
+            .otherwise(pl.lit("NONE"))
+            .alias("preferred_stock_type"),
+            # Stock warning level
+            pl.when(pl.col("stock_total") == 0)
+            .then(pl.lit("⚠️ OUT OF STOCK"))
+            .when(pl.col("stock_neuf") == 0)
+            .then(pl.lit("⚠️ NO NEUF - OCCA only"))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit("⚠️ LOW NEUF STOCK"))
+            .when(pl.col("stock_neuf") > 3)
+            .then(pl.lit("✅ NEUF IN STOCK"))
+            .otherwise(pl.lit("❓ STOCK UNKNOWN"))
+            .alias("stock_warning"),
+            # Total available (prioritize NEUF)
+            pl.col("stock_total").alias("stock_available_total"),
+        ]
+    )
+
+    # Clean up: keep only relevant columns
+    df = df.select(
+        [
+            "part_number",
+            "display_name",
+            "unit",
+            "designation",
+            "module_type",
+            # Stock information (real data)
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_date",
+            "has_stock_neuf",
+            "has_stock_occa",
+            "has_stock",
+            "stock_label",
+            "stock_category",
+            "stock_warning",
+            "preferred_stock_type",
+            "stock_available_total",
+            # Status flags
+            "in_service",
+            "procurable",
+            "repairable",
+            "scrap",
+            "pn_in_production",
+            "is_available",
+            # Compatibility
+            "nha_compatibility_list",
+            "comments",
+        ]
+    )
+
+    # Sort by stock availability (NEUF first, then OCCA)
+    df = df.sort(["stock_neuf", "stock_occa"], descending=True)
+
+    output.write_table(df)
