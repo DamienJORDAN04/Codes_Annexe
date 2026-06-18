@@ -1,0 +1,292 @@
+"""
+Intermediate Transform: Configuration Matrix
+
+Creates a comprehensive matrix combining interchangeability rules with amendment logic.
+This is the core dataset that powers the configuration validation.
+
+NOW WITH REAL STOCK DATA (NEUF/OCCA) from daily stock updates.
+NOW WITH EXPANDED SLOTS (JEU D'OBRM → OBRM_COM/OBRM_MON, PSC → PSM_COM/PSM_MON)
+
+Inputs:
+  - interchangeability_expanded (with physical slot names)
+  - enriched_parts (with real stock_neuf, stock_occa, pn_in_production)
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/configuration_matrix
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/configuration_matrix"),
+    interchangeability=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/interchangeability_expanded"
+    ),
+    enriched_parts=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/enriched_parts"),
+)
+def compute(
+    interchangeability: LightweightInput,
+    enriched_parts: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Build configuration matrix showing:
+    - Which card (new_pn) can replace which (old_pn) in which LRU
+    - What amendment results from this swap
+    - Required nameplate actions
+    - Superseded amendments
+    - Real stock levels (NEUF + OCCA)
+    - Production status (pn_in_production)
+
+    NOW USING EXPANDED SLOTS:
+    - Uses physical_slot_name (OBRM_COM, PSM_COM) instead of abstract names
+    - Allows proper joining with slot_groups_metadata
+
+    This is the main lookup table for the application.
+    """
+
+    df_interch = interchangeability.polars(lazy=True)
+    df_parts = enriched_parts.polars(lazy=True)
+
+    # DEBUG: Check if pn_in_production exists in enriched_parts
+    print("=" * 80)
+    print("DEBUG: Checking enriched_parts columns...")
+    parts_columns = df_parts.collect_schema().names()
+    print(f"DEBUG: enriched_parts has {len(parts_columns)} columns")
+    print(f"DEBUG: Column names: {parts_columns}")
+    print(f"DEBUG: pn_in_production in columns: {'pn_in_production' in parts_columns}")
+
+    if "pn_in_production" in parts_columns:
+        # Collect a small sample to verify data
+        parts_sample = (
+            df_parts.select(
+                [
+                    pl.col("part_number"),
+                    pl.col("pn_in_production"),
+                ]
+            )
+            .limit(5)
+            .collect()
+        )
+        print(f"DEBUG: enriched_parts sample:")
+        print(f"{parts_sample}")
+    else:
+        print("CRITICAL: pn_in_production column NOT FOUND in enriched_parts!")
+    print("=" * 80)
+
+    # Start with interchangeability as base (all valid swaps)
+    # Join with parts catalog to get stock and metadata
+    # Join on new_pn to get stock availability
+    df = df_interch.join(
+        df_parts.select(
+            [
+                pl.col("part_number"),
+                pl.col("display_name").alias("part_display_name"),
+                pl.col("stock_neuf"),
+                pl.col("stock_occa"),
+                pl.col("stock_total"),
+                pl.col("stock_label"),
+                pl.col("stock_display").alias("part_stock_display"),
+                pl.col("is_available"),
+                pl.col("in_service"),
+                pl.col("procurable"),
+                pl.col("repairable"),
+                pl.col("has_stock"),
+                pl.col("has_stock_neuf"),
+                pl.col("has_stock_occa"),
+                pl.col("preferred_stock_type"),
+                pl.col("stock_category"),
+                pl.col("pn_in_production"),  # NEW: Production status
+            ]
+        ),
+        left_on="new_pn",
+        right_on="part_number",
+        how="left",
+    )
+
+    # DEBUG: Check if pn_in_production survived the join
+    print("=" * 80)
+    print("DEBUG: Checking after join...")
+    joined_columns = df.collect_schema().names()
+    print(f"DEBUG: After join, has {len(joined_columns)} columns")
+    print(f"DEBUG: Column names: {joined_columns}")
+    print(f"DEBUG: pn_in_production in joined result: {'pn_in_production' in joined_columns}")
+
+    if "pn_in_production" in joined_columns:
+        joined_sample = (
+            df.select(
+                [
+                    pl.col("new_pn"),
+                    pl.col("pn_in_production"),
+                ]
+            )
+            .limit(5)
+            .collect()
+        )
+        print(f"DEBUG: After join sample:")
+        print(f"{joined_sample}")
+    else:
+        print("CRITICAL: pn_in_production LOST AFTER JOIN!")
+    print("=" * 80)
+
+    # Calculate recommendation score
+    # Priority: STD > Amendment with NEUF stock > Amendment with OCCA > Amendment without stock
+    df = df.with_columns(
+        [
+            # Base score for amendment type
+            pl.when(pl.col("amendment_letter") == "STD")
+            .then(pl.lit(1000))
+            .when(pl.col("verdict_type") == "STANDARD")
+            .then(pl.lit(900))
+            .otherwise(pl.lit(500))
+            .alias("base_score"),
+            # Stock bonus
+            pl.when(pl.col("stock_neuf") > 3)
+            .then(pl.lit(300))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit(200))
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.lit(100))
+            .otherwise(pl.lit(0))
+            .alias("stock_score"),
+            # Availability bonus
+            pl.when(pl.col("is_available") == True).then(pl.lit(50)).otherwise(pl.lit(0)).alias("availability_score"),
+        ]
+    )
+
+    df = df.with_columns(
+        [(pl.col("base_score") + pl.col("stock_score") + pl.col("availability_score")).alias("recommendation_score")]
+    )
+
+    # Add composite keys for quick lookup
+    df = df.with_columns(
+        [
+            # Key for lookup: "LRU::OLD_PN::NEW_PN"
+            pl.concat_str(
+                [
+                    pl.col("applicable_lru_pn"),
+                    pl.lit("::"),
+                    pl.col("old_pn"),
+                    pl.lit("::"),
+                    pl.col("new_pn"),
+                ]
+            ).alias("swap_key"),
+            # Visual status badge
+            pl.when(pl.col("amendment_letter") == "STD")
+            .then(pl.lit("🟢 STANDARD"))
+            .when(pl.col("verdict_type") == "STANDARD")
+            .then(pl.lit("🟢 STANDARD"))
+            .otherwise(pl.concat_str([pl.lit("🟠 AMENDMENT "), pl.col("amendment_letter")]))
+            .alias("visual_status"),
+            # Stock warning
+            pl.when((pl.col("stock_neuf") == 0) & (pl.col("stock_occa") == 0))
+            .then(pl.lit("⚠️ OUT OF STOCK"))
+            .when(pl.col("stock_neuf") == 0)
+            .then(pl.lit("⚠️ NO NEUF STOCK"))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit("⚠️ LOW STOCK"))
+            .otherwise(pl.lit("✅ IN STOCK"))
+            .alias("stock_warning"),
+            # Impact category
+            pl.when(pl.col("amendment_letter") == "STD")
+            .then(pl.lit("NO_IMPACT"))
+            .when(pl.col("verdict_type") == "STANDARD")
+            .then(pl.lit("NO_IMPACT"))
+            .otherwise(pl.lit("AMENDMENT_REQUIRED"))
+            .alias("impact_category"),
+            # Interchangeability verdict
+            pl.when(pl.col("verdict_type").str.contains("STANDARD"))
+            .then(pl.lit("Compatible - No amendment impact"))
+            .when(pl.col("verdict_type").str.contains("AMENDEMENT"))
+            .then(pl.lit("Compatible - Amendment required"))
+            .otherwise(pl.lit("Check compatibility"))
+            .alias("compatibility_message"),
+            # Is this swap available? (has NEUF or OCCA stock and in service)
+            ((pl.col("in_service") == "Yes") & ((pl.col("has_stock")) | (pl.col("procurable") == "Yes"))).alias(
+                "swap_available"
+            ),
+        ]
+    )
+
+    # Add display labels
+    df = df.with_columns(
+        [
+            pl.concat_str(
+                [
+                    pl.col("new_pn"),
+                    pl.lit(" - "),
+                    pl.col("part_display_name").fill_null(""),
+                ]
+            ).alias("new_pn_label"),
+            pl.concat_str(
+                [
+                    pl.col("new_pn"),
+                    pl.lit(" ("),
+                    pl.col("physical_slot_name"),  # Use physical slot name
+                    pl.lit(") - "),
+                    pl.col("visual_status"),
+                    pl.lit(" - "),
+                    pl.col("part_stock_display"),
+                ]
+            ).alias("entire_description"),
+        ]
+    )
+
+    # Select final columns (keep both original and physical slot names)
+    df = df.select(
+        [
+            "unit",
+            "applicable_lru_pn",
+            "old_pn",
+            "new_pn",
+            "designation",  # Original (abstract) name
+            "physical_slot_name",  # Physical slot name (for joining with groups)
+            "original_designation",  # Abstract name preserved
+            "is_expanded_slot",  # Flag indicating if this was expanded
+            "verdict_type",
+            "amendment_letter",
+            "swap_logic_json",
+            "all_supersedes",
+            # Keys
+            "swap_key",
+            "expanded_swap_key",
+            # Stock data
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_label",
+            "part_stock_display",
+            "stock_warning",
+            "stock_category",
+            "preferred_stock_type",
+            "has_stock",
+            "has_stock_neuf",
+            "has_stock_occa",
+            # Part metadata
+            "part_display_name",
+            "is_available",
+            "in_service",
+            "procurable",
+            "repairable",
+            "pn_in_production",  # NEW: Production status
+            # Calculated fields
+            "recommendation_score",
+            "base_score",
+            "stock_score",
+            "availability_score",
+            "visual_status",
+            "impact_category",
+            "compatibility_message",
+            "swap_available",
+            "new_pn_label",
+            "entire_description",
+        ]
+    )
+
+    # Sort by priority (STD first, then by stock availability)
+    df = df.sort(
+        ["applicable_lru_pn", "designation", "recommendation_score"],
+        descending=[False, False, True],
+    )
+
+    output.write_table(df)
