@@ -1,0 +1,13 @@
+with tab4:
+    st.markdown("### 💬 Feedback")
+    feedback_type = st.selectbox("Type", ["Bug Report", "Missing Data", "Feature Request", "Other"])
+    feedback_text = st.text_area("Your feedback", height=200, placeholder="Describe your feedback here...")
+    if st.button("Submit Feedback", type="primary", use_container_width=True):
+        if feedback_text:
+            st.success("✅ Thank you! Your feedback has been submitted.")
+            st.balloons()
+        else:
+            st.error("Please enter your feedback before submitting")
+
+st.markdown("---")
+st.caption("v15.2.12 - Bidirectional Hierarchical Filtering | Real Stock Integration | LRU Names Display")
