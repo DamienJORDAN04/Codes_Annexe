@@ -1,0 +1,179 @@
+"""
+Intermediate Transform: Enriched Parts Catalog
+
+Enriches the Parts catalog with interchangeability information.
+Joins avionics_parts (with real NEUF/OCCA stock) with interchangeability rules.
+
+Inputs:
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts (with stock)
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/enriched_parts
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/enriched_parts"
+    ),
+    parts=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"
+    ),
+    interch=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability"
+    ),
+)
+def compute(
+    parts: LightweightInput, interch: LightweightInput, output: LightweightOutput
+) -> None:
+    """
+    Enrich parts catalog with interchangeability info.
+
+    Joins:
+    - parts.part_number = interch.new_pn (LEFT JOIN)
+
+    Adds:
+    - Replacement information (which old PN this replaces)
+    - Impact on amendments
+    - Compatible LRU list
+    - Stock information (NEUF + OCCA)
+    - Production status (pn_in_production)
+    """
+    df_parts = parts.polars(lazy=True)
+    df_interch = interch.polars(lazy=True)
+
+    # Aggregate interchangeability info by new_pn
+    # For each new PN, list all old PNs it can replace and all compatible LRUs
+    df_interch_agg = df_interch.group_by("new_pn").agg(
+        [
+            pl.col("old_pn").unique().alias("replaces_pns"),
+            pl.col("applicable_lru_pn").unique().alias("compatible_lru_pns"),
+            pl.col("impact_category").unique().alias("impact_categories"),
+            pl.col("amendment_letter").unique().alias("amendment_letters"),
+            pl.col("designation").first().alias("designation_from_interch"),
+            pl.count().alias("interchangeability_rules_count"),
+        ]
+    )
+
+    # Join parts with aggregated interchangeability
+    df = df_parts.join(
+        df_interch_agg, left_on="part_number", right_on="new_pn", how="left"
+    )
+
+    # Add flags
+    df = df.with_columns(
+        [
+            # Is this PN a replacement for another?
+            pl.col("replaces_pns").is_not_null().alias("is_replacement"),
+            # Number of LRUs this card is compatible with
+            pl.col("compatible_lru_pns")
+            .list.len()
+            .fill_null(0)
+            .alias("compatible_lru_count"),
+            # Has interchangeability rules defined
+            (pl.col("interchangeability_rules_count").fill_null(0) > 0).alias(
+                "has_interchangeability_rules"
+            ),
+        ]
+    )
+
+    # Create search-friendly text fields
+    df = df.with_columns(
+        [
+            # Full text for search
+            (
+                pl.col("part_number").fill_null("")
+                + " "
+                + pl.col("display_name").fill_null("")
+                + " "
+                + pl.col("designation").fill_null("")
+                + " "
+                + pl.col("unit").fill_null("")
+            ).alias("search_text"),
+            # Stock display with NEUF/OCCA distinction
+            pl.when(pl.col("stock_neuf") > 0)
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("NEUF: "),
+                        pl.col("stock_neuf").cast(pl.Utf8),
+                        pl.when(pl.col("stock_occa") > 0)
+                        .then(
+                            pl.concat_str(
+                                [
+                                    pl.lit(" | OCCA: "),
+                                    pl.col("stock_occa").cast(pl.Utf8),
+                                ]
+                            )
+                        )
+                        .otherwise(pl.lit("")),
+                    ]
+                )
+            )
+            .when(pl.col("stock_occa") > 0)
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("OCCA: "),
+                        pl.col("stock_occa").cast(pl.Utf8),
+                        pl.lit(" (No NEUF)"),
+                    ]
+                )
+            )
+            .otherwise(pl.lit("No stock"))
+            .alias("stock_display"),
+        ]
+    )
+
+    # CRITICAL FIX: Explicitly select all columns to ensure pn_in_production is included
+    df = df.select(
+        [
+            # Keys
+            "part_number",
+            "display_name",
+            "unit",
+            "designation",
+            "module_type",
+            # Stock information (real data from avionics_parts)
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_date",
+            "has_stock_neuf",
+            "has_stock_occa",
+            "has_stock",
+            "stock_label",
+            "stock_category",
+            "stock_warning",
+            "preferred_stock_type",
+            "stock_available_total",
+            "stock_display",
+            # Status flags from avionics_parts
+            "in_service",
+            "procurable",
+            "repairable",
+            "scrap",
+            "pn_in_production",  # CRITICAL: Production status
+            "is_available",
+            # Compatibility from avionics_parts
+            "nha_compatibility_list",
+            "comments",
+            # Interchangeability info (aggregated)
+            "replaces_pns",
+            "compatible_lru_pns",
+            "impact_categories",
+            "amendment_letters",
+            "designation_from_interch",
+            "interchangeability_rules_count",
+            # Computed flags
+            "is_replacement",
+            "compatible_lru_count",
+            "has_interchangeability_rules",
+            "search_text",
+        ]
+    )
+
+    output.write_table(df)
