@@ -1,0 +1,224 @@
+"""
+Intermediate: Interchangeability Expanded
+
+Expands abstract designations to physical slots DYNAMICALLY.
+
+v15.2.8 MAJOR REFACTOR - NO HARDCODING:
+- Reads parsed_amendment_rules to detect which slots are part of groups
+- Automatically expands abstract names to physical slots based on group detection
+- If a slot is part of a group (slot_type="group") → Expands to _COM/_MON variants
+- If a slot is standalone (slot_type="mandatory") → Keeps as-is, will be normalized later
+
+This allows adding new LRU references without code changes.
+
+Input: interchangeability, parsed_amendment_rules
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/interchangeability_expanded
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/interchangeability_expanded"),
+    interchangeability=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability"),
+    parsed_rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
+)
+def compute(interchangeability: LightweightInput, parsed_rules: LightweightInput, output: LightweightOutput) -> None:
+    """
+    v15.2.8: Dynamically expands abstract card designations to physical slot names.
+
+    NO HARDCODING - Detection is based on parsed_amendment_rules data:
+    - If slot appears in parsed_rules with slot_type="group" → It's a group slot (expand to _COM/_MON)
+    - Otherwise → It's a standalone slot (keep as-is, normalize later)
+
+    Examples:
+    - LA2K2B + "PSC" → Detects PSM_COM/PSM_MON in rules → Expands to both
+    - 350E05 + "PSC" → Detects PSM_CARD in rules (no group) → Keeps as "PSC" (normalized later)
+    """
+
+    df_interch = interchangeability.polars(lazy=True)
+    df_rules = parsed_rules.polars(lazy=True)
+
+    # ================================================================
+    # STEP 1: Build dynamic mapping from parsed_amendment_rules
+    # ================================================================
+    # Extract LRU family (first 6 characters for family-level grouping)
+    df_rules = df_rules.with_columns([pl.col("target_lru_pn").str.slice(0, 6).alias("lru_family")])
+
+    # Collect all group slots (slot_type = "group")
+    df_group_slots = (
+        df_rules.filter((pl.col("slot_type") == "group") & (pl.col("slot_name").is_not_null()))
+        .select(["lru_family", "slot_name", "group_name"])
+        .unique()
+    )
+
+    # Collect to build the mapping dictionary
+    group_slots_data = df_group_slots.collect()
+
+    # Build mapping: {(lru_family, base_slot_name): [physical_slot_1, physical_slot_2, ...]}
+    # Example: {("LA2K2B", "PSM"): ["PSM_COM", "PSM_MON"]}
+    group_mapping = {}
+
+    for row in group_slots_data.iter_rows(named=True):
+        lru_family = row["lru_family"]
+        slot_name = row["slot_name"]
+
+        # Extract base name (remove _COM, _MON, _CARD suffixes)
+        base_name = slot_name
+        for suffix in ["_COM", "_MON", "_CARD"]:
+            if base_name.endswith(suffix):
+                base_name = base_name[: -len(suffix)]
+                break
+
+        key = (lru_family, base_name)
+
+        if key not in group_mapping:
+            group_mapping[key] = set()
+
+        group_mapping[key].add(slot_name)
+
+    # Convert sets to sorted lists for consistency
+    group_mapping = {k: sorted(list(v)) for k, v in group_mapping.items()}
+
+    print("=" * 80)
+    print("🔍 DYNAMIC GROUP DETECTION:")
+    print(f"Detected {len(group_mapping)} group configurations")
+    for (family, base), slots in sorted(group_mapping.items()):
+        print(f"  {family} :: {base} → {slots}")
+    print("=" * 80)
+
+    # ================================================================
+    # STEP 2: Extract LRU family from interchangeability data
+    # ================================================================
+    df_interch = df_interch.with_columns([pl.col("applicable_lru_pn").str.slice(0, 6).alias("lru_family")])
+
+    # ================================================================
+    # STEP 3: For each row, determine if it needs expansion
+    # ================================================================
+    # We need to check if (lru_family, designation_normalized) exists in group_mapping
+
+    # First, normalize the designation to extract base name
+    # Examples:
+    #   - "PSC" → "PSM" (common abbreviation)
+    #   - "MODULE PSM" → "PSM"
+    #   - "JEU D'OBRM" → "OBRM_SET"
+    #   - "CARTE CPU 486" → "CPU"
+    #   - "CARTE IO" → "IO"
+
+    # Strategy: Extract keywords from designation and match with known base names
+    def normalize_designation(designation):
+        """Extract base slot name from abstract designation."""
+        if not designation:
+            return designation
+
+        designation_upper = designation.upper().strip()
+
+        # Common patterns to extract base name
+        if "PSM" in designation_upper or "PSC" in designation_upper:
+            return "PSM"
+        elif "OBRM" in designation_upper:
+            return "OBRM_SET"
+        elif "CPU" in designation_upper:
+            return "CPU"
+        elif "IO" in designation_upper:
+            # Check if it's numbered (IO1, IO2) or generic (IO)
+            if any(num in designation_upper for num in ["IO1", "IO2", "IO3", "IO4"]):
+                # Extract the numbered part (IO1, IO2, etc.)
+                for num in ["IO1", "IO2", "IO3", "IO4"]:
+                    if num in designation_upper:
+                        return num
+            return "IO"
+        elif "ARINC" in designation_upper:
+            return "ARINC64"
+        elif "BLC" in designation_upper:
+            return "BLC"
+        elif "BMC" in designation_upper:
+            return "BMC"
+        elif "WIRED" in designation_upper or "CABLE" in designation_upper or "ENSEMBLE" in designation_upper:
+            return "WIRED_ASSY"
+        else:
+            # Default: keep as-is
+            return designation_upper
+
+    # Apply normalization using Polars map_elements
+    df_interch = df_interch.with_columns(
+        [
+            pl.col("designation")
+            .map_elements(normalize_designation, return_dtype=pl.Utf8)
+            .alias("designation_normalized")
+        ]
+    )
+
+    # ================================================================
+    # STEP 4: Expand rows based on group detection
+    # ================================================================
+    expanded_dfs = []
+
+    # Collect interchangeability data to iterate
+    interch_data = df_interch.collect()
+
+    for row in interch_data.iter_rows(named=True):
+        lru_family = row["lru_family"]
+        designation_norm = row["designation_normalized"]
+
+        # Check if this should be expanded
+        key = (lru_family, designation_norm)
+
+        if key in group_mapping:
+            # EXPAND: Create one row for each physical slot in the group
+            physical_slots = group_mapping[key]
+
+            for physical_slot in physical_slots:
+                expanded_row = {**row}
+                expanded_row["physical_slot_name"] = physical_slot
+                expanded_row["original_designation"] = row["designation"]
+                expanded_row["is_expanded_slot"] = True
+                expanded_dfs.append(expanded_row)
+        else:
+            # NO EXPANSION: Keep as-is (will be normalized in app_slot_options)
+            expanded_row = {**row}
+            expanded_row["physical_slot_name"] = row["designation"]
+            expanded_row["original_designation"] = row["designation"]
+            expanded_row["is_expanded_slot"] = False
+            expanded_dfs.append(expanded_row)
+
+    # ================================================================
+    # STEP 5: Convert back to Polars DataFrame
+    # ================================================================
+    if expanded_dfs:
+        df_result = pl.DataFrame(expanded_dfs)
+    else:
+        # Fallback: no data (should not happen)
+        df_result = interch_data.with_columns(
+            [
+                pl.col("designation").alias("physical_slot_name"),
+                pl.col("designation").alias("original_designation"),
+                pl.lit(False).alias("is_expanded_slot"),
+            ]
+        )
+
+    # ================================================================
+    # STEP 6: Add metadata and sort
+    # ================================================================
+    df_result = df_result.with_columns(
+        [
+            pl.col("physical_slot_name").alias("designation_physical"),
+            pl.concat_str(
+                [
+                    pl.col("applicable_lru_pn"),
+                    pl.lit("::"),
+                    pl.col("old_pn"),
+                    pl.lit("::"),
+                    pl.col("new_pn"),
+                    pl.lit("::"),
+                    pl.col("physical_slot_name"),
+                ]
+            ).alias("expanded_swap_key"),
+        ]
+    )
+
+    # Sort for consistency
+    df_result = df_result.sort(["applicable_lru_pn", "physical_slot_name", "new_pn"])
+
+    output.write_table(df_result)
