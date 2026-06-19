@@ -1,0 +1,162 @@
+"""
+Business Logic: Slot Groups Metadata
+
+Extracts slot group information (mix_policy, group members) from amendment rules.
+This metadata is used to validate group constraints in configurations.
+
+IMPORTANT FOR LA2K2 FAMILY (FCPC A330):
+- IO_CARDS_GROUP: 4 slots (IO1_MON, IO2_MON, IO1_COM, IO2_COM) - ANY policy
+- CPU_GROUP: 2 slots (CPU_COM, CPU_MON) - ANY policy
+
+Input: parsed_amendment_rules
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata
+"""
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+from transforms.api import Input, Output, transform
+
+
+@transform(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata"
+    ),
+    parsed_rules=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"
+    ),
+)
+def compute(parsed_rules, output):
+    """
+    Creates metadata about slot groups for mix_policy validation.
+
+    For each slot that's part of a group, identifies:
+    - Which group it belongs to
+    - What's the mix_policy (ANY, SAME, etc.)
+    - Which other slots are in the same group
+    - What PNs are allowed for the group
+    """
+
+    df = parsed_rules.dataframe()
+
+    # Filter only slot_groups (not mandatory individual slots)
+    df_groups = df.filter(
+        (F.col("slot_type") == "group") & (F.col("group_name").isNotNull())
+    )
+
+    # For each slot in a group, collect information about the group
+    df_group_info = df_groups.groupBy(
+        "target_lru_pn", "amendment_name", "group_name", "mix_policy"
+    ).agg(
+        # Collect all slots in this group
+        F.collect_set("slot_name").alias("slots_in_group"),
+        F.count("slot_name").alias("slot_count_in_group"),
+        # Collect all allowed PNs for the group
+        F.flatten(F.collect_list("allowed_pns")).alias("group_allowed_pns_flat"),
+        # Collect distinct allowed PNs
+        F.array_distinct(F.flatten(F.collect_list("allowed_pns"))).alias(
+            "group_allowed_pns"
+        ),
+    )
+
+    # Create a row for EACH slot in the group
+    df_exploded = df_group_info.withColumn(
+        "slot_name", F.explode(F.col("slots_in_group"))
+    )
+
+    # For each slot, list the OTHER slots in the same group
+    df_exploded = df_exploded.withColumn(
+        "other_slots_in_group",
+        F.array_except(F.col("slots_in_group"), F.array(F.col("slot_name"))),
+    )
+
+    # Create group key
+    df_exploded = df_exploded.withColumn(
+        "group_key",
+        F.concat_ws(
+            "::", F.col("target_lru_pn"), F.col("amendment_name"), F.col("group_name")
+        ),
+    )
+
+    # Extract LRU family (first 6 characters: LA2K2B, 350E05)
+    df_exploded = df_exploded.withColumn(
+        "lru_family", F.substring(F.col("target_lru_pn"), 1, 6)
+    )
+
+    # Create slot keys (both exact and family-based)
+    df_exploded = df_exploded.withColumn(
+        "slot_key_exact", F.concat_ws("::", F.col("target_lru_pn"), F.col("slot_name"))
+    )
+
+    df_exploded = df_exploded.withColumn(
+        "slot_key_family", F.concat_ws("::", F.col("lru_family"), F.col("slot_name"))
+    )
+
+    # Keep slot_key for compatibility (same as slot_key_exact)
+    df_exploded = df_exploded.withColumn("slot_key", F.col("slot_key_exact"))
+
+    # Add validation instructions based on mix_policy
+    df_exploded = df_exploded.withColumn(
+        "mix_policy_description",
+        F.when(
+            F.col("mix_policy") == "ANY",
+            F.concat(
+                F.lit("✅ ANY policy: "),
+                F.col("slot_name"),
+                F.lit(
+                    " can have any PN from the group's allowed list, independently of: "
+                ),
+                F.concat_ws(", ", F.col("other_slots_in_group")),
+            ),
+        )
+        .when(
+            F.col("mix_policy") == "SAME",
+            F.concat(
+                F.lit("⚠️ SAME policy: "),
+                F.col("slot_name"),
+                F.lit(" must have the SAME PN as: "),
+                F.concat_ws(" and ", F.col("other_slots_in_group")),
+            ),
+        )
+        .otherwise(F.concat(F.lit("❓ Unknown policy: "), F.col("mix_policy"))),
+    )
+
+    # Add UI hint
+    df_exploded = df_exploded.withColumn(
+        "ui_hint",
+        F.when(
+            F.col("mix_policy") == "ANY",
+            F.lit("User can freely choose any allowed PN for each slot"),
+        )
+        .when(
+            F.col("mix_policy") == "SAME",
+            F.lit("Auto-fill: All slots in group must have identical PN"),
+        )
+        .otherwise(F.lit("Check documentation for this policy")),
+    )
+
+    # Add group size indicator
+    df_exploded = df_exploded.withColumn(
+        "group_size_label",
+        F.concat(
+            F.col("slot_count_in_group").cast(StringType()),
+            F.lit(" slots in "),
+            F.col("group_name"),
+        ),
+    )
+
+    # Format other slots as comma-separated string
+    df_exploded = df_exploded.withColumn(
+        "other_slots_str", F.concat_ws(", ", F.col("other_slots_in_group"))
+    )
+
+    # Format group allowed PNs as comma-separated string
+    df_exploded = df_exploded.withColumn(
+        "group_allowed_pns_str", F.concat_ws(", ", F.col("group_allowed_pns"))
+    )
+
+    # Add validation flag
+    df_exploded = df_exploded.withColumn(
+        "requires_group_validation", F.col("mix_policy").isNotNull()
+    )
+
+    output.write_dataframe(df_exploded)
