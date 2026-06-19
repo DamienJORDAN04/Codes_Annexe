@@ -1,0 +1,217 @@
+"""
+Business Logic: Reverse Search SRU
+
+Finds all compatible LRUs for a given SRU (card).
+Shows the amendment impact for each compatible LRU.
+
+Use case: "I have card LA5D00300H3810B, which LRUs can I install it in?"
+
+IMPORTANT: ALL displayed options are COMPATIBLE (GO).
+The difference is which amendment must be applied:
+- STD: No amendment
+- Single: Specific amendment required
+- Multiple: User chooses from available amendments
+
+NOW WITH REAL STOCK DATA (NEUF/OCCA).
+NOW WITH PRODUCTION STATUS (pn_in_production).
+
+Input: configuration_matrix (with real stock + pn_in_production)
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/sru_to_lru_lookup
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/sru_to_lru_lookup"),
+    config_matrix=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/configuration_matrix"),
+)
+def compute(config_matrix: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Creates a reverse lookup table: SRU -> Compatible LRUs
+
+    For each SRU (new_pn), shows:
+    - All compatible LRUs (ALL are GO if listed)
+    - Amendment impact (STD / Single Amendment / Multiple Choice)
+    - Amendment options for multiple choice cases
+    - Stock availability (NEUF + OCCA)
+    - Production status (pn_in_production)
+    - Whether it's a replacement or new card
+    """
+
+    df = config_matrix.polars(lazy=True)
+
+    # Group by new_pn (the SRU we're searching for)
+    df_reverse = df.select(
+        [
+            "new_pn",
+            "new_pn_label",
+            "part_display_name",
+            "designation",
+            "applicable_lru_pn",
+            "unit",
+            "amendment_letter",
+            "visual_status",
+            "impact_category",
+            "entire_description",
+            "old_pn",
+            # Stock info (NEUF/OCCA)
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_label",
+            "part_stock_display",
+            "stock_warning",
+            "preferred_stock_type",
+            "has_stock_neuf",
+            "has_stock_occa",
+            "swap_available",
+            "recommendation_score",
+            "swap_logic_json",
+            "pn_in_production",  # NEW: Production status
+        ]
+    )
+
+    # Extract amendment requirement type from swap logic
+    df_reverse = df_reverse.with_columns(
+        [
+            # Amendment type
+            pl.when(pl.col("swap_logic_json").is_null())
+            .then(pl.lit("NO_RULE"))
+            .when(pl.col("swap_logic_json").str.contains("STD"))
+            .then(pl.lit("STD"))
+            .when(pl.col("swap_logic_json").str.contains("or"))
+            .then(pl.lit("MULTIPLE_CHOICE"))
+            .when(pl.col("swap_logic_json").str.contains("amdt"))
+            .then(pl.lit("SINGLE_AMDT"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("amendment_type"),
+            # Extract amendment options for multiple choice
+            pl.when(pl.col("swap_logic_json").str.contains("or"))
+            .then(pl.col("swap_logic_json").str.json_path_match("$.or"))
+            .otherwise(pl.lit(None))
+            .alias("amendment_options_json"),
+        ]
+    )
+
+    # Add impact badges for UI display - ALL are compatible, show what's required
+    df_reverse = df_reverse.with_columns(
+        [
+            # Impact badge - describes amendment requirement
+            pl.when(pl.col("amendment_type") == "STD")
+            .then(pl.lit("🟢 NO AMENDMENT - Maintains STANDARD"))
+            .when(pl.col("amendment_type") == "SINGLE_AMDT")
+            .then(pl.concat_str([pl.lit("🟠 REQUIRES AMENDMENT "), pl.col("amendment_letter")]))
+            .when(pl.col("amendment_type") == "MULTIPLE_CHOICE")
+            .then(pl.lit("🟡 AMENDMENT CHOICE REQUIRED"))
+            .otherwise(pl.lit("❓ UNKNOWN REQUIREMENT"))
+            .alias("impact_badge"),
+            # Compatibility summary - ALL listed are compatible
+            pl.when(pl.col("amendment_type") == "STD")
+            .then(pl.lit("✅ Compatible - No amendment impact"))
+            .when(pl.col("amendment_type") == "SINGLE_AMDT")
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("✅ Compatible - Amendment "),
+                        pl.col("amendment_letter"),
+                        pl.lit(" required"),
+                    ]
+                )
+            )
+            .when(pl.col("amendment_type") == "MULTIPLE_CHOICE")
+            .then(pl.lit("✅ Compatible - Select amendment to apply"))
+            .otherwise(pl.lit("❓ Check CMM for requirements"))
+            .alias("compatibility_summary"),
+            # Stock availability summary (NEUF preferred)
+            pl.when(pl.col("stock_neuf") > 0)
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("✅ NEUF: "),
+                        pl.col("stock_neuf").cast(pl.Utf8),
+                        pl.when(pl.col("stock_occa") > 0)
+                        .then(
+                            pl.concat_str(
+                                [
+                                    pl.lit(" | OCCA: "),
+                                    pl.col("stock_occa").cast(pl.Utf8),
+                                ]
+                            )
+                        )
+                        .otherwise(pl.lit("")),
+                    ]
+                )
+            )
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.concat_str([pl.lit("🟡 OCCA only: "), pl.col("stock_occa").cast(pl.Utf8)]))
+            .otherwise(pl.lit("⚠️ Out of stock"))
+            .alias("stock_summary"),
+            # Create search key
+            pl.concat_str([pl.col("new_pn"), pl.lit("::"), pl.col("applicable_lru_pn")]).alias("sru_lru_key"),
+        ]
+    )
+
+    # Add ranking for recommendations
+    df_reverse = df_reverse.with_columns(
+        [
+            # Rank by preference: STD > NEUF > Single Amendment > OCCA > Multiple Choice
+            (
+                pl.when(pl.col("amendment_type") == "STD")
+                .then(pl.lit(1000))  # Highest priority - no amendment
+                .when(pl.col("amendment_type") == "SINGLE_AMDT")
+                .then(pl.lit(500))  # Medium priority - clear amendment
+                .when(pl.col("amendment_type") == "MULTIPLE_CHOICE")
+                .then(pl.lit(300))  # Lower priority - requires choice
+                .otherwise(pl.lit(100))
+                + pl.when(pl.col("stock_neuf") > 0)
+                .then(pl.lit(200))  # Bonus for NEUF
+                .otherwise(pl.lit(0))
+                + pl.when(pl.col("stock_occa") > 0)
+                .then(pl.lit(50))  # Smaller bonus for OCCA
+                .otherwise(pl.lit(0))
+                + pl.col("stock_total").fill_null(0)
+            ).alias("search_rank")
+        ]
+    )
+
+    # Sort by rank (best options first)
+    df_reverse = df_reverse.sort(["new_pn", "search_rank"], descending=[False, True])
+
+    # Add count of compatible LRUs per SRU
+    df_counts = df_reverse.group_by("new_pn").agg(
+        [
+            pl.count().alias("compatible_lru_count"),
+            pl.col("applicable_lru_pn").n_unique().alias("unique_lru_count"),
+            # Count by amendment type
+            pl.col("amendment_type").filter(pl.col("amendment_type") == "STD").count().alias("std_options_count"),
+            pl.col("amendment_type")
+            .filter(pl.col("amendment_type") == "SINGLE_AMDT")
+            .count()
+            .alias("single_amdt_count"),
+            pl.col("amendment_type")
+            .filter(pl.col("amendment_type") == "MULTIPLE_CHOICE")
+            .count()
+            .alias("multi_amdt_count"),
+        ]
+    )
+
+    df_reverse = df_reverse.join(df_counts, on="new_pn", how="left")
+
+    # CRITICAL FIX: Remove duplicates
+    # Multiple identical rows can come from configuration_matrix if slots were expanded incorrectly
+    # Keep only unique combinations of (new_pn, applicable_lru_pn, old_pn, amendment_letter, designation)
+    df_reverse = df_reverse.unique(
+        subset=[
+            "new_pn",
+            "applicable_lru_pn",
+            "old_pn",
+            "amendment_letter",
+            "designation",
+        ],
+        keep="first",
+        maintain_order=True,
+    )
+
+    output.write_table(df_reverse)
