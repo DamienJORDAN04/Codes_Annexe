@@ -1,0 +1,221 @@
+"""
+Output Transform: LRU Stock with Names
+
+Creates a clean dataset containing:
+- LRU Part Numbers (from slot_options)
+- LRU Names (Unit from avionics_parts)
+- LRU Designation
+- Real Stock Data (NEUF/OCCA from stock_daily)
+- Production Status
+
+This dataset is used by the Avionics Configuration Manager application
+to display LRU stock information in Tab 2 and Tab 3.
+
+Inputs:
+  - slot_options (to get unique list of LRU PNs)
+  - avionics_parts (to get LRU names/designations)
+  - stock_daily (to get real stock data)
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/lru_stock_with_names
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/lru_stock_with_names"
+    ),
+    slot_options=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"
+    ),
+    avionics_parts=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"
+    ),
+    stock_daily=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily"
+    ),
+)
+def compute(
+    slot_options: LightweightInput,
+    avionics_parts: LightweightInput,
+    stock_daily: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Create LRU stock dataset with names.
+
+    Process:
+    1. Extract unique LRU PNs from slot_options
+    2. Join with avionics_parts to get Unit (LRU name) and Designation
+    3. Join with stock_daily to get real stock data
+    4. Add computed flags and labels
+    """
+
+    # STEP 1: Get unique list of LRU Part Numbers from slot_options
+    df_slots = slot_options.polars(lazy=True)
+
+    # Extract unique LRU PNs (applicable_lru_pn is the LRU identifier)
+    lru_pns = (
+        df_slots.select("applicable_lru_pn")
+        .unique()
+        .filter(pl.col("applicable_lru_pn").is_not_null())
+        .rename({"applicable_lru_pn": "lru_pn"})
+    )
+
+    # STEP 2: Join with avionics_parts to get LRU names and designations
+    df_parts = avionics_parts.polars(lazy=True)
+
+    # Join on part_number = lru_pn
+    df_lru_info = lru_pns.join(
+        df_parts.select(
+            [
+                "part_number",
+                "unit",  # LRU commercial name (e.g., "ADIRU", "FCU")
+                "designation",  # Full designation
+                "pn_in_production",  # Production status
+                "in_service",
+                "procurable",
+                "repairable",
+            ]
+        ),
+        left_on="lru_pn",
+        right_on="part_number",
+        how="left",
+    )
+
+    # STEP 3: Join with stock_daily to get real stock data
+    df_stock = stock_daily.polars(lazy=True)
+
+    df_lru_stock = df_lru_info.join(
+        df_stock.select(
+            [
+                "part_number",
+                "stock_neuf",
+                "stock_occa",
+                "stock_total",
+                "has_stock_neuf",
+                "has_stock_occa",
+                "has_stock",
+                "stock_label",
+                "stock_category",
+                "stock_date",
+            ]
+        ),
+        left_on="lru_pn",
+        right_on="part_number",
+        how="left",
+    )
+
+    # STEP 4: Clean and enrich data
+    df_lru_stock = df_lru_stock.with_columns(
+        [
+            # Fill nulls for LRUs not in stock dataset
+            pl.col("stock_neuf").fill_null(0),
+            pl.col("stock_occa").fill_null(0),
+            pl.col("stock_total").fill_null(0),
+            pl.col("has_stock_neuf").fill_null(False),
+            pl.col("has_stock_occa").fill_null(False),
+            pl.col("has_stock").fill_null(False),
+            pl.col("stock_label").fill_null("❌ No stock data"),
+            pl.col("stock_category").fill_null("NO_STOCK"),
+            # Fill nulls for LRUs not in avionics_parts
+            pl.col("unit").fill_null("Unknown LRU"),
+            pl.col("designation").fill_null("No designation available"),
+            pl.col("pn_in_production").fill_null("No"),
+            pl.col("in_service").fill_null("Unknown"),
+            pl.col("procurable").fill_null("Unknown"),
+            pl.col("repairable").fill_null("Unknown"),
+        ]
+    )
+
+    # STEP 5: Add computed columns for UI display
+    df_lru_stock = df_lru_stock.with_columns(
+        [
+            # LRU display label: "ADIRU (0271112380)"
+            pl.concat_str(
+                [pl.col("unit"), pl.lit(" ("), pl.col("lru_pn"), pl.lit(")")],
+                separator="",
+            ).alias("lru_display_label"),
+            # Stock summary label for UI
+            pl.when(pl.col("stock_total") == 0)
+            .then(pl.lit("❌ No stock"))
+            .when((pl.col("stock_neuf") > 0) & (pl.col("stock_occa") > 0))
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("✅ NEUF: "),
+                        pl.col("stock_neuf").cast(pl.Utf8),
+                        pl.lit(" | OCCA: "),
+                        pl.col("stock_occa").cast(pl.Utf8),
+                    ],
+                    separator="",
+                )
+            )
+            .when(pl.col("stock_neuf") > 0)
+            .then(
+                pl.concat_str(
+                    [pl.lit("✅ NEUF: "), pl.col("stock_neuf").cast(pl.Utf8)],
+                    separator="",
+                )
+            )
+            .when(pl.col("stock_occa") > 0)
+            .then(
+                pl.concat_str(
+                    [pl.lit("🟡 OCCA only: "), pl.col("stock_occa").cast(pl.Utf8)],
+                    separator="",
+                )
+            )
+            .otherwise(pl.lit("❌ No stock"))
+            .alias("lru_stock_summary"),
+            # Stock status icon
+            pl.when(pl.col("stock_neuf") > 5)
+            .then(pl.lit("✅"))
+            .when(pl.col("stock_neuf").is_between(1, 5))
+            .then(pl.lit("⚠️"))
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.lit("🟡"))
+            .otherwise(pl.lit("❌"))
+            .alias("stock_status_icon"),
+            # Is LRU available? (has stock + in service)
+            ((pl.col("stock_total") > 0) & (pl.col("in_service") == "Yes")).alias(
+                "is_lru_available"
+            ),
+        ]
+    )
+
+    # STEP 6: Select final columns
+    df_result = df_lru_stock.select(
+        [
+            # Identifiers
+            "lru_pn",
+            "unit",  # LRU name (e.g., "ADIRU")
+            "designation",  # Full designation
+            # Display labels (for UI)
+            "lru_display_label",  # "ADIRU (0271112380)"
+            "lru_stock_summary",  # "✅ NEUF: 3 | OCCA: 1"
+            "stock_status_icon",  # ✅ ⚠️ 🟡 ❌
+            # Stock data
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_date",
+            # Stock flags
+            "has_stock_neuf",
+            "has_stock_occa",
+            "has_stock",
+            "stock_category",
+            # Status flags
+            "pn_in_production",
+            "in_service",
+            "procurable",
+            "repairable",
+            "is_lru_available",
+        ]
+    )
+
+    # STEP 7: Sort by stock availability (NEUF first, then OCCA, then alphabetically)
+    df_result = df_result.sort(["stock_neuf", "stock_occa", "lru_pn"], descending=[True, True, False])
+
+    output.write_table(df_result)
