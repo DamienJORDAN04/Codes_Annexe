@@ -1,0 +1,302 @@
+"""
+Business Logic: Validate Interchangeability
+
+Validates if a card (new_pn) can physically replace another card (old_pn) in a specific LRU.
+
+LEVEL 1 validation - checks physical/electrical compatibility.
+
+IMPORTANT: ALL swaps with a defined rule are COMPATIBLE (GO verdict).
+
+NOW WITH:
+- Real stock data (NEUF/OCCA)
+- Slot group awareness with FAMILY-BASED matching
+- Physical slot expansion (PSC → PSM_COM + PSM_MON)
+
+FAMILY MATCHING:
+- Extracts first 6 characters as lru_family (LA2K2B, 350E05)
+- All LRUs in same family share same group rules
+- Example: LA2K2B1002C0000 and LA2K2B100DR0000 both match LA2K2B::PSM_COM
+
+Input: configuration_matrix (with physical slots), slot_groups_metadata
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation"),
+    config_matrix=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/configuration_matrix"),
+    slot_groups=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata"),
+)
+def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Creates validation lookup table with family-based group matching.
+
+    For each swap, provides:
+    - Compatibility verdict (GO/NO-GO)
+    - Amendment requirements
+    - Stock availability
+    - Group constraints (if part of a group like PSM_GROUP, IO_CARDS_GROUP)
+    """
+
+    df = config_matrix.polars(lazy=True)
+    df_groups = slot_groups.polars(lazy=True)
+
+    # DEBUG: Check if pn_in_production exists in config_matrix
+    print("=" * 80)
+    print("DEBUG: validate_interchangeability.py - Checking config_matrix input")
+    config_columns = df.collect_schema().names()
+    print(f"DEBUG: config_matrix has {len(config_columns)} columns")
+    print(f"DEBUG: pn_in_production in config_matrix: {'pn_in_production' in config_columns}")
+    if "pn_in_production" in config_columns:
+        config_sample = (
+            df.select(
+                [
+                    pl.col("new_pn"),
+                    pl.col("pn_in_production"),
+                ]
+            )
+            .limit(5)
+            .collect()
+        )
+        print(f"DEBUG: config_matrix sample with pn_in_production:")
+        print(f"{config_sample}")
+    else:
+        print("CRITICAL: pn_in_production NOT FOUND in config_matrix!")
+        print(f"Available columns: {config_columns}")
+    print("=" * 80)
+
+    # Parse swap_logic_json
+    df = df.with_columns(
+        [
+            pl.col("swap_logic_json").str.json_path_match("$.req").alias("swap_req_raw"),
+            pl.when(pl.col("swap_logic_json").is_null())
+            .then(pl.lit("NO_RULE"))
+            .when(pl.col("swap_logic_json").str.contains("STD"))
+            .then(pl.lit("COMPATIBLE_STD"))
+            .when(pl.col("swap_logic_json").str.contains("amdt"))
+            .then(pl.lit("COMPATIBLE_SINGLE_AMDT"))
+            .when(pl.col("swap_logic_json").str.contains("or"))
+            .then(pl.lit("COMPATIBLE_MULTIPLE_AMDT"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("compatibility_level"),
+            pl.when(pl.col("swap_logic_json").str.contains("or"))
+            .then(pl.col("swap_logic_json").str.json_path_match("$.or"))
+            .when(pl.col("swap_logic_json").str.contains("amdt"))
+            .then(pl.concat_str([pl.lit('["'), pl.col("amendment_letter"), pl.lit('"]')]))
+            .when(pl.col("swap_logic_json").str.contains("STD"))
+            .then(pl.lit('["STD"]'))
+            .otherwise(pl.lit(None))
+            .alias("amendment_options_json"),
+            pl.when(pl.col("swap_logic_json").str.contains("or"))
+            .then(pl.col("swap_logic_json").str.count_matches('"') / 2)
+            .when(pl.col("swap_logic_json").is_not_null())
+            .then(pl.lit(1))
+            .otherwise(pl.lit(0))
+            .alias("amendment_options_count"),
+            pl.col("swap_logic_json").str.contains("or").fill_null(False).alias("requires_amendment_choice"),
+            (pl.col("swap_logic_json").is_not_null() & ~pl.col("swap_logic_json").str.contains("or")).alias(
+                "is_direct_swap"
+            ),
+            pl.concat_str(
+                [pl.col("applicable_lru_pn"), pl.lit("::"), pl.col("old_pn"), pl.lit("::"), pl.col("new_pn")]
+            ).alias("validation_key"),
+        ]
+    )
+
+    # FAMILY-BASED JOIN FOR SLOT GROUPS
+    # Extract LRU family (first 6 characters: LA2K2B, 350E05, etc.)
+    df = df.with_columns([pl.col("applicable_lru_pn").str.slice(0, 6).alias("lru_family")])
+
+    # Create family-based join key
+    df = df.with_columns(
+        [pl.concat_str([pl.col("lru_family"), pl.lit("::"), pl.col("physical_slot_name")]).alias("slot_key_family")]
+    )
+
+    # Prepare slot_groups for join (use family key)
+    df_groups_for_join = df_groups.select(
+        [
+            "slot_key_family",
+            "group_name",
+            "mix_policy",
+            "other_slots_str",
+            "group_allowed_pns_str",
+            "slot_count_in_group",
+            "mix_policy_description",
+            "ui_hint",
+        ]
+    )
+
+    # Left join on family key
+    df = df.join(df_groups_for_join, left_on="slot_key_family", right_on="slot_key_family", how="left")
+
+    # Add group flags
+    df = df.with_columns(
+        [
+            pl.col("group_name").is_not_null().alias("is_part_of_group"),
+            pl.when(pl.col("group_name").is_not_null())
+            .then(
+                pl.when(pl.col("mix_policy") == "ANY")
+                .then(
+                    pl.concat_str(
+                        [
+                            pl.lit("ℹ️ This slot is part of "),
+                            pl.col("group_name"),
+                            pl.lit(" with slots: "),
+                            pl.col("other_slots_str"),
+                            pl.lit(". ANY policy: Can mix different PNs."),
+                        ]
+                    )
+                )
+                .when(pl.col("mix_policy") == "SAME")
+                .then(
+                    pl.concat_str(
+                        [
+                            pl.lit("⚠️ This slot is part of "),
+                            pl.col("group_name"),
+                            pl.lit(" with slots: "),
+                            pl.col("other_slots_str"),
+                            pl.lit(". SAME policy: All slots must have identical PN."),
+                        ]
+                    )
+                )
+                .otherwise(pl.lit(""))
+            )
+            .otherwise(pl.lit(""))
+            .alias("group_constraint_message"),
+        ]
+    )
+
+    # Validation messages
+    df = df.with_columns(
+        [
+            pl.when(pl.col("compatibility_level") == "NO_RULE")
+            .then(pl.lit("❌ No interchangeability rule defined - Contact engineering"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_STD")
+            .then(pl.lit("✅ Compatible - Returns to STANDARD configuration"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_SINGLE_AMDT")
+            .then(pl.concat_str([pl.lit("✅ Compatible - Requires Amendment "), pl.col("amendment_letter")]))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_MULTIPLE_AMDT")
+            .then(pl.lit("✅ Compatible - Amendment selection required (see options)"))
+            .otherwise(pl.lit("❓ Unknown compatibility - Check CMM"))
+            .alias("validation_message"),
+            pl.when(pl.col("requires_amendment_choice"))
+            .then(pl.lit("User must select one of the available amendment options"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_STD")
+            .then(pl.lit("Returns to STANDARD - No amendment required"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_SINGLE_AMDT")
+            .then(pl.concat_str([pl.lit("Must apply Amendment "), pl.col("amendment_letter")]))
+            .otherwise(pl.lit("No amendment information"))
+            .alias("amendment_requirement"),
+            pl.when((pl.col("stock_neuf") == 0) & (pl.col("stock_occa") == 0))
+            .then(pl.lit("⚠️ OUT OF STOCK"))
+            .when(pl.col("stock_neuf") == 0)
+            .then(pl.lit("⚠️ NO NEUF - OCCA ONLY"))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit("⚠️ LOW NEUF STOCK"))
+            .when(pl.col("stock_neuf") > 3)
+            .then(pl.lit("✅ NEUF IN STOCK"))
+            .otherwise(pl.lit("❓ STOCK UNKNOWN"))
+            .alias("stock_warning_level"),
+            pl.when(pl.col("compatibility_level") == "NO_RULE")
+            .then(pl.lit("NO-GO"))
+            .when((pl.col("in_service") != "Yes") & (pl.col("in_service") != "yes"))
+            .then(pl.lit("NO-GO"))
+            .otherwise(pl.lit("GO"))
+            .alias("interchangeability_verdict"),
+        ]
+    )
+
+    # Select final columns - RENAME all_supersedes back to supersedes for output compatibility
+    df = df.select(
+        [
+            "validation_key",
+            "applicable_lru_pn",
+            "lru_family",
+            "old_pn",
+            "new_pn",
+            "designation",
+            "physical_slot_name",
+            "original_designation",
+            "is_expanded_slot",
+            "unit",
+            # Validation
+            "interchangeability_verdict",
+            "compatibility_level",
+            "validation_message",
+            "is_direct_swap",
+            "requires_amendment_choice",
+            "amendment_options_json",
+            "amendment_options_count",
+            "amendment_requirement",
+            # Amendment
+            "amendment_letter",
+            pl.col("all_supersedes").alias("supersedes"),  # RENAME: all_supersedes → supersedes for output
+            "swap_logic_json",
+            "impact_category",
+            # Stock
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "stock_warning",
+            "stock_warning_level",
+            "stock_label",
+            "part_stock_display",
+            "preferred_stock_type",
+            "has_stock_neuf",
+            "has_stock_occa",
+            "swap_available",
+            # Part metadata (NEW: production status)
+            "pn_in_production",  # ✅ ADD: Production status from enriched_parts
+            "in_service",
+            "procurable",
+            "repairable",
+            "is_available",
+            # Group info
+            "is_part_of_group",
+            "group_name",
+            "mix_policy",
+            "other_slots_str",
+            "group_constraint_message",
+            "slot_count_in_group",
+            "group_allowed_pns_str",
+            "ui_hint",
+            "slot_key_family",
+            # Display
+            "part_display_name",
+            "visual_status",
+            "compatibility_message",
+            "new_pn_label",
+            "entire_description",
+            # Recommendation
+            "recommendation_score",
+        ]
+    )
+
+    # DEBUG: Verify pn_in_production is in final output
+    print("=" * 80)
+    print("DEBUG: validate_interchangeability.py - Checking FINAL output schema")
+    final_columns = df.collect_schema().names()
+    print(f"DEBUG: Final output has {len(final_columns)} columns")
+    print(f"DEBUG: pn_in_production in final output: {'pn_in_production' in final_columns}")
+    if "pn_in_production" in final_columns:
+        final_sample = (
+            df.select(
+                [
+                    pl.col("new_pn"),
+                    pl.col("pn_in_production"),
+                ]
+            )
+            .limit(5)
+            .collect()
+        )
+        print(f"DEBUG: Final output sample with pn_in_production:")
+        print(f"{final_sample}")
+    else:
+        print("CRITICAL: pn_in_production NOT IN FINAL OUTPUT!")
+        print(f"Final columns: {final_columns}")
+    print("=" * 80)
+
+    output.write_table(df)
