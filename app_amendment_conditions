@@ -1,0 +1,67 @@
+"""
+Output Dataset: Amendment Conditions Detail
+
+Lightweight dataset for amendment conditions display.
+Used for: "What are the detailed conditions for Amendment A?"
+
+OPTIMIZED FOR SCALE:
+- Only 9 essential columns
+- Small dataset (~50-300 rows)
+- Fast queries
+
+Input: amendment_conditions
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_conditions
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_conditions"
+    ),
+    conditions=Input(
+        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_conditions"
+    ),
+)
+def compute(conditions: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Minimal amendment conditions lookup.
+
+    Contains ONLY conditions display info:
+    1. Required slots
+    2. Conditions summary
+    3. Context dependencies (case count)
+
+    Query pattern: WHERE amendment_key = 'LRU::AMDT'
+    """
+
+    df = conditions.polars(lazy=True)
+
+    # Select ONLY essential columns (9 columns max)
+    df_minimal = df.select(
+        [
+            # Keys
+            "amendment_key",
+            "target_lru_pn",
+            "amendment_name",
+            # Conditions
+            "conditions_formatted",
+            "conditions_summary",
+            "required_slots_str",
+            # Context
+            "case_count",
+            "mandatory_slots_count",
+            # Display
+            "description",
+        ]
+    )
+
+    # Remove duplicates (should be one row per amendment_key)
+    df_minimal = df_minimal.unique(subset=["amendment_key"], maintain_order=True)
+
+    # Sort by LRU and amendment
+    df_minimal = df_minimal.sort(["target_lru_pn", "amendment_name"])
+
+    output.write_table(df_minimal)
