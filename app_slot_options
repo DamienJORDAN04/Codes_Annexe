@@ -1,0 +1,753 @@
+"""
+Output Dataset: Slot Configuration Options
+
+Ultra-lightweight dataset for dropdown population in the UI.
+Used for: "What cards can I put in slot PSM_COM of LRU X?"
+
+OPTIMIZED FOR SCALE:
+- Only essential columns
+- Pre-filtered for GO verdict only
+- Pre-sorted by recommendation (STD > NEUF > amendments)
+- NOW WITH GROUP AWARENESS (shows if slot is part of IO_CARDS_GROUP or CPU_GROUP)
+- NOW WITH PRODUCTION STATUS (pn_in_production)
+- Memory efficient
+
+FIXED: Deduplication now uses physical_slot_name to preserve all PNs per slot
+v15.1: Added physical_slot_name normalization ("CARTE XXX" -> "XXX_CARD")
+v15.1.2: Remove _CARD suffix for specific slots (ARINC64, BLC, BMC)
+v15.1.3: Normalize ENSEMBLE CABLE -> WIRED_ASSY
+v15.2.13: FIX MULTIPLE context_pn per BLC/BMC - Store as comma-separated string (NO explosion)
+
+Input: swap_validation
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"),
+    validation=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation"),
+    amendment_rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
+)
+def compute(validation: LightweightInput, amendment_rules: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Minimal slot options for dropdown menus.
+
+    Pre-filtered: ONLY GO verdicts (compatible cards only)
+    Pre-sorted: Best options first (STD > NEUF > amendments)
+
+    NOW WITH GROUP INFO:
+    - Shows if slot is part of a group (IO_CARDS_GROUP, CPU_GROUP)
+    - Shows mix_policy (ANY = can mix PNs)
+    - Shows other slots in the same group
+
+    NOW WITH PRODUCTION STATUS:
+    - Shows pn_in_production (Yes/No)
+
+    v15.1 NORMALIZATION:
+    - Transforms physical_slot_name: "CARTE XXX" -> "XXX_CARD"
+    - This matches the naming convention in parsed_amendment_rules
+
+    v15.2.13 FIX: BLC/BMC cards now store ALL compatible WIRED_ASSY as comma-separated string
+    Example:
+    - BLC LA1E00300H39200 compatible with 3 WIRED_ASSY → context_pn = "PN1, PN2, PN3"
+    - This ensures correct filtering in the UI (show ALL compatible BLC/BMC, not just one)
+    - NO row explosion: single row per card with all context_pn values
+
+    Query pattern:
+      WHERE applicable_lru_pn = 'LRU_X'
+      AND physical_slot_name = 'CPU1_CARD'  -- normalized format
+      AND interchangeability_verdict = 'GO'
+    """
+
+    df = validation.polars(lazy=True)
+
+    # Filter: ONLY compatible cards (GO verdict)
+    df_go_only = df.filter(pl.col("interchangeability_verdict") == "GO")
+
+    # Select essential columns (added group columns + supersedes + pn_in_production)
+    df_minimal = df_go_only.select(
+        [
+            # Keys
+            "applicable_lru_pn",
+            "designation",
+            "physical_slot_name",
+            "original_designation",
+            "is_expanded_slot",
+            "new_pn",
+            "old_pn",
+            # Display
+            "part_display_name",
+            # Amendment info
+            "amendment_letter",
+            "supersedes",
+            "compatibility_level",
+            "requires_amendment_choice",
+            # Stock
+            "stock_neuf",
+            "stock_occa",
+            # Group info
+            "is_part_of_group",
+            "group_name",
+            "mix_policy",
+            "other_slots_str",
+            "group_constraint_message",
+            # Ranking
+            "recommendation_score",
+            # Production status
+            "pn_in_production",  # NEW: Production status
+        ]
+    )
+
+    # ==========================================
+    # v15.2.8 NORMALIZATION: Transform physical_slot_name with multiple patterns
+    # ==========================================
+    # Patterns:
+    #   - "CARTE XXX" -> "XXX_CARD"
+    #   - "MODULE XXX" -> "XXX_CARD"
+    #   - "JEU D'XXX" -> "XXX_CARD"
+    #   - "ENSEMBLE XXX" -> "XXX_CARD"
+    # Examples:
+    #   - "CARTE CPU1" -> "CPU1_CARD"
+    #   - "MODULE PSM" -> "PSM_CARD"
+    #   - "JEU D'OBRM" -> "OBRM_SET_CARD" (will be further normalized to OBRM_SET_CARD)
+    #   - "BMC" -> "BMC" (no change - no prefix)
+
+    df_minimal = df_minimal.with_columns(
+        [
+            # Pattern 1: "CARTE XXX"
+            pl.when(pl.col("physical_slot_name").str.starts_with("CARTE "))
+            .then(
+                pl.col("physical_slot_name").str.strip_prefix("CARTE ").str.strip_chars().str.replace_all(r"\s+", "")
+                + pl.lit("_CARD")
+            )
+            # Pattern 2: "MODULE XXX"
+            .when(pl.col("physical_slot_name").str.starts_with("MODULE "))
+            .then(
+                pl.col("physical_slot_name").str.strip_prefix("MODULE ").str.strip_chars().str.replace_all(r"\s+", "")
+                + pl.lit("_CARD")
+            )
+            # Pattern 3: "JEU D'XXX" or "JEU D XXX"
+            # Special case: "JEU D'OBRM" -> "OBRM_SET_CARD"
+            .when(pl.col("physical_slot_name").str.contains("(?i)^JEU D[' ]?OBRM"))
+            .then(pl.lit("OBRM_SET_CARD"))
+            .when(pl.col("physical_slot_name").str.contains("(?i)^JEU D[' ]?"))
+            .then(
+                pl.col("physical_slot_name")
+                .str.replace(r"(?i)^JEU D[' ]?", "")
+                .str.strip_chars()
+                .str.replace_all(r"\s+", "")
+                + pl.lit("_CARD")
+            )
+            # Pattern 4: "ENSEMBLE XXX"
+            .when(pl.col("physical_slot_name").str.starts_with("ENSEMBLE "))
+            .then(
+                pl.col("physical_slot_name").str.strip_prefix("ENSEMBLE ").str.strip_chars().str.replace_all(r"\s+", "")
+                + pl.lit("_CARD")
+            )
+            # No pattern matched: keep as-is
+            .otherwise(pl.col("physical_slot_name"))
+            .alias("physical_slot_name")
+        ]
+    )
+
+    # ==========================================
+    # v15.2.8 FIX: Dynamic slot normalization based on group detection
+    # ==========================================
+    # Match exactly with parsed_amendment_rules naming convention.
+    #
+    # Logic:
+    # - If is_part_of_group = False AND slot ends with _COM or _MON
+    #   → Remove suffix and add _CARD
+    #   Example: PSM_COM (standalone) → PSM_CARD
+    #
+    # - Special cases without _CARD suffix (hierarchical slots):
+    #   ARINC64_CARD → ARINC64
+    #   BLC_CARD → BLC
+    #   BMC_CARD → BMC
+    #
+    # - Group slots (is_part_of_group = True) keep _COM/_MON as-is
+
+    df_minimal = df_minimal.with_columns(
+        [
+            # STEP 1: Handle standalone slots with _COM/_MON suffix
+            pl.when(
+                (~pl.col("is_part_of_group"))
+                & (
+                    pl.col("physical_slot_name").str.ends_with("_COM")
+                    | pl.col("physical_slot_name").str.ends_with("_MON")
+                )
+            )
+            .then(
+                # Remove _COM/_MON suffix and add _CARD
+                pl.when(pl.col("physical_slot_name").str.ends_with("_COM"))
+                .then(pl.col("physical_slot_name").str.strip_suffix("_COM") + pl.lit("_CARD"))
+                .when(pl.col("physical_slot_name").str.ends_with("_MON"))
+                .then(pl.col("physical_slot_name").str.strip_suffix("_MON") + pl.lit("_CARD"))
+                .otherwise(pl.col("physical_slot_name"))
+            )
+            # STEP 2: Special cases (remove _CARD suffix for hierarchical slots)
+            .when(pl.col("physical_slot_name") == "ARINC64_CARD")
+            .then(pl.lit("ARINC64"))
+            .when(pl.col("physical_slot_name") == "BLC_CARD")
+            .then(pl.lit("BLC"))
+            .when(pl.col("physical_slot_name") == "BMC_CARD")
+            .then(pl.lit("BMC"))
+            # STEP 3: Group slots keep their names as-is
+            .otherwise(pl.col("physical_slot_name"))
+            .alias("physical_slot_name")
+        ]
+    )
+
+    # ==========================================
+    # v15.1.3 FIX: Normalize ENSEMBLE CABLE -> WIRED_ASSY
+    # v15.2.11 FIX: Also normalize CABLE_CARD -> WIRED_ASSY
+    # v15.2.12 FIX: Also normalize original_designation for ui_slot_key
+    # ==========================================
+    # Ensure complete harmonization across all datasets
+    # ENSEMBLE CABLE and CABLE_CARD are old names, WIRED_ASSY is the canonical name
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("physical_slot_name") == "ENSEMBLE CABLE")
+            .then(pl.lit("WIRED_ASSY"))
+            .when(pl.col("physical_slot_name") == "CABLE_CARD")
+            .then(pl.lit("WIRED_ASSY"))
+            .otherwise(pl.col("physical_slot_name"))
+            .alias("physical_slot_name")
+        ]
+    )
+
+    # ==========================================
+    # v15.2.12 FIX: Normalize original_designation too
+    # ==========================================
+    # For non-grouped slots, ui_slot_key uses original_designation
+    # So we need to normalize it the same way as physical_slot_name
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("original_designation") == "ENSEMBLE CABLE")
+            .then(pl.lit("WIRED_ASSY"))
+            .when(pl.col("original_designation") == "CABLE_CARD")
+            .then(pl.lit("WIRED_ASSY"))
+            .otherwise(pl.col("original_designation"))
+            .alias("original_designation")
+        ]
+    )
+
+    # Add display label for dropdown (with group info + production status)
+    df_minimal = df_minimal.with_columns(
+        [
+            # Format: "PN_NUMBER - Description (NEUF: X) [GROUP] [PRODUCTION STATUS]"
+            pl.concat_str(
+                [
+                    pl.col("new_pn"),
+                    pl.lit(" - "),
+                    pl.col("part_display_name").fill_null(""),
+                    pl.when(pl.col("stock_neuf") > 0)
+                    .then(
+                        pl.concat_str(
+                            [
+                                pl.lit(" (NEUF: "),
+                                pl.col("stock_neuf").cast(pl.Utf8),
+                                pl.lit(")"),
+                            ]
+                        )
+                    )
+                    .when(pl.col("stock_occa") > 0)
+                    .then(
+                        pl.concat_str(
+                            [
+                                pl.lit(" (OCCA: "),
+                                pl.col("stock_occa").cast(pl.Utf8),
+                                pl.lit(")"),
+                            ]
+                        )
+                    )
+                    .otherwise(pl.lit(" (No stock)")),
+                    # Add group indicator
+                    pl.when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "ANY"))
+                    .then(
+                        pl.concat_str(
+                            [
+                                pl.lit(" ["),
+                                pl.col("group_name"),
+                                pl.lit(" - MIX ALLOWED]"),
+                            ]
+                        )
+                    )
+                    .when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "SAME"))
+                    .then(
+                        pl.concat_str(
+                            [
+                                pl.lit(" ["),
+                                pl.col("group_name"),
+                                pl.lit(" - SAME PN REQUIRED]"),
+                            ]
+                        )
+                    )
+                    .otherwise(pl.lit("")),
+                    # Add production status indicator
+                    pl.when(pl.col("pn_in_production") == "Yes")
+                    .then(pl.lit(" [IN PROD]"))
+                    .when(pl.col("pn_in_production") == "No")
+                    .then(pl.lit(" [OUT OF PROD]"))
+                    .otherwise(pl.lit("")),
+                ]
+            ).alias("dropdown_label"),
+            # Simple amendment badge
+            pl.when(pl.col("compatibility_level") == "COMPATIBLE_STD")
+            .then(pl.lit("STD"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_SINGLE_AMDT")
+            .then(pl.col("amendment_letter"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_MULTIPLE_AMDT")
+            .then(pl.lit("CHOICE"))
+            .otherwise(pl.lit(""))
+            .alias("amendment_badge"),
+            # Group hint for UI
+            pl.when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "ANY"))
+            .then(
+                pl.concat_str(
+                    [
+                        pl.lit("ℹ️ Can mix with different PNs in: "),
+                        pl.col("other_slots_str"),
+                    ]
+                )
+            )
+            .when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "SAME"))
+            .then(pl.concat_str([pl.lit("⚠️ Must match PN in: "), pl.col("other_slots_str")]))
+            .otherwise(pl.lit(""))
+            .alias("group_hint"),
+            # Production status display
+            pl.when(pl.col("pn_in_production") == "Yes")
+            .then(pl.lit("**IN PRODUCTION**"))
+            .when(pl.col("pn_in_production") == "No")
+            .then(pl.lit("OUT OF PRODUCTION"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("production_status_display"),
+        ]
+    )
+
+    # Add dynamic slot grouping column for proper UI display
+    # - If is_part_of_group = true  -> use physical_slot_name (normalized: CPU1_CARD, CPU2_CARD, etc.)
+    # - If is_part_of_group = false -> use original_designation (MODULE PSM, MODULE CPU, etc.)
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("is_part_of_group"))
+            .then(pl.col("physical_slot_name"))  # Now normalized: XXX_CARD
+            .otherwise(pl.col("original_designation"))
+            .alias("ui_slot_key")
+        ]
+    )
+
+    # Sort: STD first, then by NEUF stock, then by recommendation score
+    # IMPORTANT: Trier par physical_slot_name pour préserver l'ordre COM/MON
+    df_minimal = df_minimal.sort(
+        ["applicable_lru_pn", "physical_slot_name", "recommendation_score"],
+        descending=[False, False, True],
+    )
+
+    # DEDUPLICATION LOGIC:
+    # - Pour LRU AVEC groupes (is_part_of_group = true): garder physical_slot_name distinct
+    #   -> CPU1_CARD et CPU2_CARD sont 2 dropdowns séparés avec les mêmes cartes
+    # - Pour LRU SANS groupes (is_part_of_group = false): dédupliquer par ui_slot_key + new_pn
+    #   -> MODULE PSM n'apparaît qu'une fois avec toutes les cartes
+
+    # Première déduplication: par physical_slot (préserve toutes les lignes pour les groupes)
+    df_minimal = df_minimal.unique(subset=["applicable_lru_pn", "physical_slot_name", "new_pn"], maintain_order=True)
+
+    # CORRECTION: Deuxième déduplication pour les LRU SANS groupes
+    # Si is_part_of_group = false, la même carte apparaît en CPU1_CARD et CPU2_CARD
+    # On garde seulement la première occurrence par (lru, ui_slot_key, new_pn)
+    df_no_group = df_minimal.filter(~pl.col("is_part_of_group"))
+    df_with_group = df_minimal.filter(pl.col("is_part_of_group"))
+
+    # Pour les cartes sans groupe, dédupliquer par ui_slot_key
+    df_no_group = df_no_group.unique(subset=["applicable_lru_pn", "ui_slot_key", "new_pn"], maintain_order=True)
+
+    # Recombiner
+    df_minimal = pl.concat([df_with_group, df_no_group])
+
+    # ================================================================
+    # ENRICHMENT: Add amendment-specific supersedes from rules
+    # ================================================================
+    # For cards with multiple amendments (K, N), get supersedes for EACH amendment
+
+    # Load amendment rules (Spark -> convert to Polars)
+    df_rules = amendment_rules.polars(lazy=True)
+
+    # Create a mapping: (lru_pn, amendment) -> supersedes
+    df_amendment_supersedes = df_rules.select(
+        [
+            pl.col("target_lru_pn"),
+            pl.col("amendment_name"),
+            pl.col("supersedes"),
+        ]
+    ).unique(subset=["target_lru_pn", "amendment_name"])
+
+    # Parse amendment_letter into list
+    df_minimal = df_minimal.with_columns([pl.col("amendment_letter").str.split(", ").alias("amendment_options_list")])
+
+    # For cards with MULTIPLE amendments, create amendment_specific_supersedes
+    # IMPORTANT: Create a separate column to normalize supersedes BEFORE using it in struct
+    df_minimal = df_minimal.with_columns([pl.col("supersedes").alias("global_supersedes")])
+
+    # Helper function to build amendment-specific supersedes
+    def build_amendment_supersedes(lru_pn, amendments, global_supersedes, rules_dict):
+        """
+        For each amendment in the list, get its specific supersedes from rules.
+        CRITICAL: All string/list handling MUST be done before any concatenation.
+        """
+        import json
+
+        if not amendments or len(amendments) <= 1:
+            return None
+
+        # ========================================================================
+        # STEP 1: NORMALIZE global_supersedes TO LIST - NO EXCEPTIONS
+        # ========================================================================
+        # This MUST happen FIRST before ANY other operations
+        if global_supersedes is None:
+            global_supersedes_list = []
+        elif isinstance(global_supersedes, str):
+            # String case: parse to list
+            if global_supersedes.strip().startswith("["):
+                # JSON array string
+                try:
+                    global_supersedes_list = json.loads(global_supersedes)
+                    if not isinstance(global_supersedes_list, list):
+                        global_supersedes_list = []
+                except:
+                    global_supersedes_list = []
+            elif "," in global_supersedes:
+                # Comma-separated
+                global_supersedes_list = [s.strip() for s in global_supersedes.split(",") if s.strip()]
+            elif global_supersedes.strip():
+                # Single value
+                global_supersedes_list = [global_supersedes.strip()]
+            else:
+                global_supersedes_list = []
+        elif isinstance(global_supersedes, list):
+            # Already a list
+            global_supersedes_list = global_supersedes
+        else:
+            # Unknown type - treat as empty
+            global_supersedes_list = []
+
+        # Double check: ensure it's really a list
+        if not isinstance(global_supersedes_list, list):
+            global_supersedes_list = []
+        # ========================================================================
+
+        result = {}
+        for amdt in amendments:
+            # Create lookup key
+            lookup_key = f"{lru_pn}::{amdt}"
+
+            # Check if we have supersedes for this LRU + amendment
+            if lookup_key in rules_dict:
+                rule_supersedes = rules_dict[lookup_key]
+
+                # Normalize rule_supersedes to list
+                if rule_supersedes is None:
+                    rule_supersedes_list = []
+                elif isinstance(rule_supersedes, str):
+                    if "," in rule_supersedes:
+                        rule_supersedes_list = [s.strip() for s in rule_supersedes.split(",") if s.strip()]
+                    elif rule_supersedes.strip():
+                        rule_supersedes_list = [rule_supersedes.strip()]
+                    else:
+                        rule_supersedes_list = []
+                elif isinstance(rule_supersedes, list):
+                    rule_supersedes_list = rule_supersedes
+                else:
+                    rule_supersedes_list = []
+
+                if rule_supersedes_list:
+                    result[amdt] = rule_supersedes_list
+                else:
+                    # Fallback: global + other amendments
+                    other_amdts = [a for a in amendments if a != amdt]
+                    # SAFE: Both are guaranteed to be lists now
+                    result[amdt] = list(set(global_supersedes_list + other_amdts))
+            else:
+                # Fallback: global + other amendments
+                other_amdts = [a for a in amendments if a != amdt]
+                # SAFE: Both are guaranteed to be lists now
+                result[amdt] = list(set(global_supersedes_list + other_amdts))
+
+        return json.dumps(result) if result else None
+
+    # Apply the enrichment using Polars map_elements
+    # Note: This is computationally expensive, only apply to cards with requires_amendment_choice
+    df_with_choice = df_minimal.filter(
+        pl.col("requires_amendment_choice") & (pl.col("amendment_options_list").list.len() > 1)
+    )
+
+    df_without_choice = df_minimal.filter(
+        ~(pl.col("requires_amendment_choice") & (pl.col("amendment_options_list").list.len() > 1))
+    )
+
+    # For cards with choice, build amendment_specific_supersedes
+    if len(df_with_choice.collect()) > 0:
+        # Collect rules once for efficiency and build a lookup dict
+        rules_collected = df_amendment_supersedes.collect()
+
+        # Create a dictionary: (lru_pn::amendment) -> supersedes
+        rules_dict = {}
+        for row in rules_collected.iter_rows(named=True):
+            key = f"{row['target_lru_pn']}::{row['amendment_name']}"
+            supersedes = row["supersedes"]
+            # Parse supersedes if it's a string - NORMALIZE TO LIST
+            if supersedes is None:
+                supersedes = []
+            elif isinstance(supersedes, str):
+                if "," in supersedes:
+                    supersedes = [s.strip() for s in supersedes.split(",") if s.strip()]
+                elif supersedes.strip():
+                    supersedes = [supersedes.strip()]
+                else:
+                    supersedes = []
+            elif not isinstance(supersedes, list):
+                supersedes = []
+            rules_dict[key] = supersedes
+
+        df_with_choice = df_with_choice.with_columns(
+            [
+                pl.struct(
+                    [
+                        pl.col("applicable_lru_pn"),
+                        pl.col("amendment_options_list"),
+                        pl.col("global_supersedes"),
+                    ]
+                )
+                .map_elements(
+                    lambda row: build_amendment_supersedes(
+                        row["applicable_lru_pn"],
+                        row["amendment_options_list"],
+                        row["global_supersedes"],
+                        rules_dict,
+                    ),
+                    return_dtype=pl.Utf8,
+                )
+                .alias("amendment_specific_supersedes")
+            ]
+        )
+    else:
+        df_with_choice = df_with_choice.with_columns([pl.lit(None).alias("amendment_specific_supersedes")])
+
+    # For cards without choice, set to None
+    df_without_choice = df_without_choice.with_columns([pl.lit(None).alias("amendment_specific_supersedes")])
+
+    # Recombine
+    df_minimal = pl.concat([df_with_choice, df_without_choice])
+
+    # Drop temporary columns (only drop amendment_options_list, _temp_struct no longer exists)
+    df_minimal = df_minimal.drop(["amendment_options_list"])
+
+    # ================================================================
+    # v15.1.4 HIERARCHY: Context-aware parent-child relationships
+    # ================================================================
+    # Build hierarchy using context_pn to link BLC/BMC to specific WIRED_ASSY
+    #
+    # Logic:
+    # - Read context_pn from rules to identify which WIRED_ASSY a BLC/BMC belongs to
+    # - Create mapping: (child_slot, child_pn, lru_pn) -> parent_pn
+    #
+    # Example:
+    #   BLC LA1E00300H39200 (in LRU X) -> belongs to WIRED_ASSY LA1E01000HW0100
+    #   BLC LA1E00100H3920D (in LRU X) -> belongs to WIRED_ASSY LA1E01000HW0200
+    #
+    # v15.2.13 FIX: MULTIPLE context_pn per BLC/BMC - Store as comma-separated string (NO explosion)
+    # CRITICAL FIX: A single BLC/BMC can be compatible with MULTIPLE WIRED_ASSY
+    # Example: BLC LA1E00300H39200 works with 3 different WIRED_ASSY PNs
+    #
+    # NEW STRATEGY: Collect ALL context_pn for each (blc_pn, lru_pn) pair
+    # Then store as comma-separated string: "PN1, PN2, PN3"
+    # Collect rules with context information
+    df_rules_collected = (
+        df_rules.select(
+            [
+                pl.col("target_lru_pn"),
+                pl.col("amendment_name"),
+                pl.col("slot_name"),
+                pl.col("slot_type"),
+                pl.col("context_pn"),
+                pl.col("allowed_pns"),
+            ]
+        )
+        .filter(pl.col("slot_type") == "mandatory")
+        .collect()
+    )
+
+    # ✅ v15.2.13 FIX: Store ALL context_pn in a list (not just one)
+    # Key: (child_pn, lru_pn) -> [parent_pn1, parent_pn2, parent_pn3, ...]
+    hierarchy_map_context_list = {}
+
+    # Also track parent_slot name (always "WIRED_ASSY")
+    # Key: (child_slot_name, child_pn, lru_pn) -> "WIRED_ASSY"
+    parent_slot_map = {}
+
+    if len(df_rules_collected) > 0:
+        # Group rules by (lru_pn, amendment_name, context_pn)
+        grouped_by_context = {}
+
+        for row in df_rules_collected.iter_rows(named=True):
+            lru_pn = row["target_lru_pn"]
+            amendment = row["amendment_name"]
+            slot_name = row["slot_name"]
+            context_pn = row.get("context_pn")
+            allowed_pns = row.get("allowed_pns")
+
+            # Parse allowed_pns if it's a string
+            if isinstance(allowed_pns, str):
+                import json
+
+                try:
+                    allowed_pns = json.loads(allowed_pns)
+                except:
+                    allowed_pns = []
+            elif not isinstance(allowed_pns, list):
+                allowed_pns = []
+
+            # Group by context
+            key = (lru_pn, amendment, context_pn if context_pn else "no_context")
+            if key not in grouped_by_context:
+                grouped_by_context[key] = {}
+
+            grouped_by_context[key][slot_name] = allowed_pns
+
+        # Analyze each context group
+        for (lru_pn, amendment, context_pn), slots_dict in grouped_by_context.items():
+            # ✅ v15.2.14 FIX: Two valid patterns to resolve the parent WIRED_ASSY PN:
+            #
+            # Pattern A (non-STD amendments): rules contain an explicit WIRED_ASSY slot
+            #   e.g. amendment F has WIRED_ASSY + BLC + BMC in mandatory_slots
+            #   → parent_pn = context_pn (from context_check) OR unique WIRED_ASSY allowed_pn
+            #
+            # Pattern B (STD amendment): rules only have BLC/BMC mandatory_slots,
+            #   the WIRED_ASSY is carried by context_check.pn ONLY (no WIRED_ASSY slot row)
+            #   → parent_pn = context_pn directly
+            #
+            # Before this fix, Pattern B was silently skipped because the condition
+            # required "WIRED_ASSY" to be present in slots_dict, which is never true for STD.
+
+            has_blc_or_bmc = "BLC" in slots_dict or "BMC" in slots_dict
+            has_wired_assy_slot = "WIRED_ASSY" in slots_dict
+            has_context = context_pn and context_pn != "no_context"
+
+            # Pattern A: WIRED_ASSY slot present in rules
+            if has_wired_assy_slot and has_blc_or_bmc:
+                wired_assy_pns = slots_dict.get("WIRED_ASSY", [])
+                if has_context:
+                    parent_pn = context_pn
+                elif len(wired_assy_pns) == 1:
+                    parent_pn = wired_assy_pns[0]
+                else:
+                    continue  # Cannot determine unique parent, skip
+
+            # Pattern B: No WIRED_ASSY slot, but context_pn IS the WIRED_ASSY PN (e.g. STD)
+            elif has_blc_or_bmc and has_context and not has_wired_assy_slot:
+                parent_pn = context_pn
+
+            else:
+                # Not a hierarchical rule, skip
+                continue
+
+            # ✅ v15.2.13 FIX: APPEND to list instead of overwriting
+            # Map each BLC PN to this WIRED_ASSY PN
+            if "BLC" in slots_dict:
+                for blc_pn in slots_dict["BLC"]:
+                    key = (blc_pn, lru_pn)
+                    if key not in hierarchy_map_context_list:
+                        hierarchy_map_context_list[key] = []
+                    # Only add if not already present (avoid duplicates)
+                    if parent_pn not in hierarchy_map_context_list[key]:
+                        hierarchy_map_context_list[key].append(parent_pn)
+                    parent_slot_map[key] = "WIRED_ASSY"
+
+            # ✅ v15.2.13 FIX: APPEND to list instead of overwriting
+            # Map each BMC PN to this WIRED_ASSY PN
+            if "BMC" in slots_dict:
+                for bmc_pn in slots_dict["BMC"]:
+                    key = (bmc_pn, lru_pn)
+                    if key not in hierarchy_map_context_list:
+                        hierarchy_map_context_list[key] = []
+                    if parent_pn not in hierarchy_map_context_list[key]:
+                        hierarchy_map_context_list[key].append(parent_pn)
+                    parent_slot_map[key] = "WIRED_ASSY"
+
+    # ✅ v15.2.13 FIX: Add context_pn as JSON array (NO explosion)
+    # For cards with multiple context_pn, store as: ["PN1", "PN2", "PN3"]
+    # For cards with single context_pn, store as: "PN1" (backward compatible)
+    # For cards with no context_pn (parents), store as: null
+
+    import json as json_lib
+
+    def format_context_pn_list(context_list):
+        """Format context_pn list as comma-separated string"""
+        if context_list is None or len(context_list) == 0:
+            return None
+        else:
+            # Return as comma-separated string: "PN1, PN2, PN3"
+            return ", ".join(context_list)
+
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.struct([pl.col("new_pn"), pl.col("applicable_lru_pn")])
+            .map_elements(
+                lambda row: parent_slot_map.get((row["new_pn"], row["applicable_lru_pn"]), None),
+                return_dtype=pl.Utf8,
+            )
+            .alias("parent_slot"),
+            pl.struct([pl.col("new_pn"), pl.col("applicable_lru_pn")])
+            .map_elements(
+                lambda row: format_context_pn_list(
+                    hierarchy_map_context_list.get((row["new_pn"], row["applicable_lru_pn"]), None)
+                ),
+                return_dtype=pl.Utf8,
+            )
+            .alias("context_pn"),
+        ]
+    )
+
+    # Add display_order for sorting (parent before children)
+    # Logic: parent slots get order 0, children get order 1
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("parent_slot").is_not_null())
+            .then(pl.lit(1))  # Child slots ordered after
+            .otherwise(pl.lit(0))  # Parent slots ordered first
+            .alias("display_order")
+        ]
+    )
+
+    # Add indented_slot_name for UI display with context
+    # ✅ v15.2.13 FIX: Handle multiple context_pn in display
+    # Format for children with single context_pn:   "    └─ SLOT_NAME (for PARENT_PN)"
+    # Format for children with multiple context_pn:  "    └─ SLOT_NAME (for multiple WIRED_ASSY)"
+    # Format for parents:                            "SLOT_NAME"
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("parent_slot").is_not_null() & pl.col("context_pn").is_not_null())
+            .then(
+                pl.when(pl.col("context_pn").str.contains(","))
+                # Multiple context_pn (comma-separated): show "for multiple WIRED_ASSY"
+                .then(pl.lit("    └─ ") + pl.col("physical_slot_name") + pl.lit(" (for multiple WIRED_ASSY)"))
+                # Single context_pn: show specific PN
+                .otherwise(
+                    pl.lit("    └─ ")
+                    + pl.col("physical_slot_name")
+                    + pl.lit(" (for ")
+                    + pl.col("context_pn")
+                    + pl.lit(")")
+                )
+            )
+            .when(pl.col("parent_slot").is_not_null())
+            .then(pl.lit("    └─ ") + pl.col("physical_slot_name"))
+            .otherwise(pl.col("physical_slot_name"))
+            .alias("indented_slot_name")
+        ]
+    )
+
+    output.write_table(df_minimal)
