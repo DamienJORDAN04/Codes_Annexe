@@ -1,0 +1,123 @@
+"""
+Output Dataset: Swap Validation Lookup
+
+Ultra-lightweight dataset for interchangeability validation.
+Used for: "Can I replace OLD_PN with NEW_PN in LRU_X?"
+
+OPTIMIZED FOR SCALE:
+- Only essential columns (now includes group info for LA2K2 family)
+- Indexed by validation_key for instant lookup
+- Memory efficient (works with 10x more data)
+- Supports mix_policy (ANY = can mix PNs in groups like CPU_COM/CPU_MON)
+
+Input: swap_validation
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_swap_validation
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_swap_validation"),
+    validation=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation"),
+)
+def compute(validation: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Minimal swap validation lookup.
+
+    Contains ONLY what's needed for:
+    1. GO/NO-GO decision
+    2. Amendment requirement
+    3. Stock availability
+    4. Group constraints (NEW for LA2K2 family)
+
+    Query pattern: WHERE validation_key = 'LRU::OLD::NEW'
+    """
+
+    df = validation.polars(lazy=True)
+
+    # Select essential columns (added group-related columns)
+    df_minimal = df.select(
+        [
+            # Keys (for queries)
+            "validation_key",
+            "applicable_lru_pn",
+            "lru_family",
+            "old_pn",
+            "new_pn",
+            "designation",
+            "physical_slot_name",
+            "original_designation",
+            "is_expanded_slot",
+            # Verdict (core decision)
+            "interchangeability_verdict",
+            "compatibility_level",
+            "validation_message",
+            # Amendment info (what to do)
+            "amendment_letter",
+            "supersedes",  # NEW: Amendements remplacés
+            "requires_amendment_choice",
+            "amendment_options_json",
+            # Stock (availability)
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            "part_stock_display",
+            # Part metadata (NEW: production status)
+            "pn_in_production",  # ✅ ADD: Production status
+            "in_service",
+            "procurable",
+            "repairable",
+            "is_available",
+            # Group info (NEW - for LA2K2 mix_policy)
+            "is_part_of_group",
+            "group_name",
+            "mix_policy",
+            "other_slots_str",
+            "group_constraint_message",
+            "ui_hint",
+            # Display
+            "part_display_name",
+        ]
+    )
+
+    # Add minimal computed fields
+    df_minimal = df_minimal.with_columns(
+        [
+            # Simple verdict icon
+            pl.when(pl.col("interchangeability_verdict") == "GO")
+            .then(pl.lit("✅"))
+            .otherwise(pl.lit("❌"))
+            .alias("verdict_icon"),
+            # Simple stock icon
+            pl.when(pl.col("stock_neuf") > 3)
+            .then(pl.lit("🟢"))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit("🟡"))
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.lit("🟠"))
+            .otherwise(pl.lit("🔴"))
+            .alias("stock_icon"),
+            # Group icon (NEW)
+            pl.when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "ANY"))
+            .then(pl.lit("🔄 MIX ALLOWED"))
+            .when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "SAME"))
+            .then(pl.lit("🔒 SAME PN REQUIRED"))
+            .when(pl.col("is_part_of_group"))
+            .then(pl.lit("🔄 GROUP"))
+            .otherwise(pl.lit(""))
+            .alias("group_icon"),
+        ]
+    )
+
+    # Remove duplicates (can happen due to multiple rules/joins upstream)
+    # IMPORTANT: Keep physical_slot_name in the key to preserve all slots
+    # (same PN can go in multiple physical slots like IO1_COM and IO2_COM)
+    df_minimal = df_minimal.unique(subset=["validation_key", "physical_slot_name"], maintain_order=True)
+
+    # Sort for optimal query performance
+    df_minimal = df_minimal.sort("validation_key")
+
+    output.write_table(df_minimal)
+
