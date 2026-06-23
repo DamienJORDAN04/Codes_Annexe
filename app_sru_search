@@ -1,0 +1,101 @@
+"""
+Output Dataset: SRU Search Lookup
+
+Ultra-lightweight dataset for reverse search.
+Used for: "I have card X, which LRUs can I install it in?"
+
+OPTIMIZED FOR SCALE:
+- Only essential columns (13 columns + pn_in_production)
+- Pre-sorted by relevance (STD first, then NEUF stock)
+- Memory efficient
+
+Input: reverse_search_sru
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_sru_search
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_sru_search"),
+    reverse_search=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/sru_to_lru_lookup"),
+)
+def compute(reverse_search: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Minimal SRU search lookup.
+
+    Contains ONLY what's needed for:
+    1. List compatible LRUs for a given SRU
+    2. Show amendment impact
+    3. Show stock availability
+    4. Show production status (pn_in_production)
+
+    Query pattern: WHERE new_pn = 'LA5D00300H3810B'
+    """
+
+    df = reverse_search.polars(lazy=True)
+
+    # Select ONLY essential columns (13 columns + pn_in_production)
+    df_minimal = df.select(
+        [
+            # Keys
+            "new_pn",
+            "applicable_lru_pn",
+            "designation",
+            # Amendment info
+            "amendment_letter",
+            "amendment_type",
+            "impact_badge",
+            # Stock
+            "stock_neuf",
+            "stock_occa",
+            "stock_total",
+            # Metadata
+            "compatible_lru_count",
+            "search_rank",
+            # Display
+            "part_display_name",
+            # Production status
+            "pn_in_production",  # NEW: Production status (Yes/No)
+        ]
+    )
+
+    # Add minimal computed fields
+    df_minimal = df_minimal.with_columns(
+        [
+            # Stock icon
+            pl.when(pl.col("stock_neuf") > 3)
+            .then(pl.lit("🟢"))
+            .when(pl.col("stock_neuf").is_between(1, 3))
+            .then(pl.lit("🟡"))
+            .when(pl.col("stock_occa") > 0)
+            .then(pl.lit("🟠"))
+            .otherwise(pl.lit("🔴"))
+            .alias("stock_icon"),
+            # Amendment icon
+            pl.when(pl.col("amendment_type") == "STD")
+            .then(pl.lit("🟢"))
+            .when(pl.col("amendment_type") == "SINGLE_AMDT")
+            .then(pl.lit("🟠"))
+            .when(pl.col("amendment_type") == "MULTIPLE_CHOICE")
+            .then(pl.lit("🟡"))
+            .otherwise(pl.lit("⚪"))
+            .alias("amendment_icon"),
+            # Production status display: BOLD if in production
+            pl.when(pl.col("pn_in_production") == "Yes")
+            .then(pl.lit("**IN PRODUCTION**"))
+            .when(pl.col("pn_in_production") == "No")
+            .then(pl.lit("OUT OF PRODUCTION"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("production_status_display"),
+        ]
+    )
+
+    # Remove duplicates (can happen due to multiple rules upstream)
+    df_minimal = df_minimal.unique(subset=["new_pn", "applicable_lru_pn", "designation"], maintain_order=True)
+
+    # Sort by search rank (best options first)
+    df_minimal = df_minimal.sort("search_rank", descending=True)
+
+    output.write_table(df_minimal)
