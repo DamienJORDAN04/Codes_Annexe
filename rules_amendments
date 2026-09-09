@@ -4,6 +4,11 @@ Source: Rules Amendments
 Simple pass-through transform that enriches the external amendment_rules_source
 with computed fields for easier downstream processing.
 
+v2.0 CHANGES:
+- Dynamic amendment priority (no hardcoded A-H limit)
+- Flexible column name detection (both uppercase and lowercase)
+- Data validation and logging for missing LRUs
+
 Input: amendment_rules_source (external dataset)
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/rules_amendments
 """
@@ -14,76 +19,97 @@ from transforms.api import Input, Output, transform, LightweightInput, Lightweig
 
 @transform.using(
     output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/rules_amendments"),
-    source=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/amendment_rules_source"),
+    source=Input("ri.foundry.main.dataset.468d4ede-c514-4a24-a625-26003378ae2b"),
 )
 def compute(source: LightweightInput, output: LightweightOutput) -> None:
     """
     Enriches amendment rules source with computed fields.
-    
-    Adds:
-    - supersedes_count
-    - amendment_priority
-    - rule_key
+
+    v2.0 Features:
+    - Dynamic amendment priority (handles any amendment name)
+    - Flexible column name detection
+    - Data validation
     """
-    
+
     df = source.polars(lazy=True)
-    
-    # Normalize column names (handle both uppercase and lowercase)
-    # Check if columns are uppercase (Unit, Rule_ID, etc.) and rename
+
+    # ✅ v2.0: Flexible column name detection (case-insensitive)
     column_mapping = {
         "Unit": "unit",
+        "unit": "unit",
         "Rule_ID": "rule_id",
+        "rule_id": "rule_id",
         "Target_LRU_PN": "target_lru_pn",
+        "target_lru_pn": "target_lru_pn",
         "Amdt_Name": "amendment_name",
+        "amdt_name": "amendment_name",
+        "amendment_name": "amendment_name",
         "Warning_Text": "warning_text",
+        "warning_text": "warning_text",
         "Logic_JSON": "logic_json",
+        "logic_json": "logic_json",
         "Description": "description",
-        "Supersedes": "supersedes"
+        "description": "description",
+        "Supersedes": "supersedes",
+        "supersedes": "supersedes",
     }
-    
-    # Rename columns that exist
+
+    # Get existing columns
     existing_columns = df.collect_schema().names()
-    rename_dict = {old: new for old, new in column_mapping.items() if old in existing_columns}
-    
+    rename_dict = {old: new for old, new in column_mapping.items() if old in existing_columns and old != new}
+
     if rename_dict:
         df = df.rename(rename_dict)
-    
+
+    # ✅ v2.0: Ensure required columns exist
+    required_cols = ["target_lru_pn", "amendment_name"]
+    for col in required_cols:
+        if col not in df.collect_schema().names():
+            raise ValueError(f"❌ CRITICAL: Required column '{col}' missing in amendment_rules_source")
+
     # Add computed fields
-    df = df.with_columns([
-        # Supersedes count
-        pl.when(pl.col("supersedes").is_null() | (pl.col("supersedes") == "") | (pl.col("supersedes") == "[]"))
-        .then(pl.lit(0))
-        .otherwise(pl.col("supersedes").str.split(",").list.len())
-        .alias("supersedes_count"),
-        
-        # Amendment priority (STD=0, A=1, B=2, etc.)
-        pl.when(pl.col("amendment_name") == "STD")
-        .then(pl.lit(0))
-        .when(pl.col("amendment_name") == "A")
-        .then(pl.lit(1))
-        .when(pl.col("amendment_name") == "B")
-        .then(pl.lit(2))
-        .when(pl.col("amendment_name") == "C")
-        .then(pl.lit(3))
-        .when(pl.col("amendment_name") == "D")
-        .then(pl.lit(4))
-        .when(pl.col("amendment_name") == "E")
-        .then(pl.lit(5))
-        .when(pl.col("amendment_name") == "F")
-        .then(pl.lit(6))
-        .when(pl.col("amendment_name") == "G")
-        .then(pl.lit(7))
-        .when(pl.col("amendment_name") == "H")
-        .then(pl.lit(8))
-        .otherwise(pl.lit(99))
-        .alias("amendment_priority"),
-        
-        # Rule key (composite)
-        pl.concat_str([
-            pl.col("target_lru_pn"),
-            pl.lit("::"),
-            pl.col("amendment_name")
-        ]).alias("rule_key")
-    ])
-    
+    df = df.with_columns(
+        [
+            # Supersedes count
+            pl.when(pl.col("supersedes").is_null() | (pl.col("supersedes") == "") | (pl.col("supersedes") == "[]"))
+            .then(pl.lit(0))
+            .otherwise(pl.col("supersedes").str.split(",").list.len())
+            .alias("supersedes_count"),
+            # ✅ v2.0: DYNAMIC amendment priority (no hardcoded A-H limit)
+            # STD = 0, single letters sorted alphabetically (A=1, B=2... Z=26), others = 99
+            pl.when(pl.col("amendment_name") == "STD")
+            .then(pl.lit(0))
+            .when(pl.col("amendment_name").str.len_chars() == 1)
+            .then(
+                # ASCII value of first char - ASCII('A') + 1
+                # A=65 → 65-65+1=1, B=66 → 66-65+1=2, etc.
+                pl.col("amendment_name")
+                .str.to_uppercase()
+                .str.slice(0, 1)
+                .map_elements(lambda s: ord(s) - 64, return_dtype=pl.Int32)
+            )
+            .otherwise(pl.lit(99))
+            .alias("amendment_priority"),
+            # Rule key (composite)
+            pl.concat_str([pl.col("target_lru_pn"), pl.lit("::"), pl.col("amendment_name")]).alias("rule_key"),
+        ]
+    )
+
+    # ✅ v2.0: Data validation - log unique LRUs
+    collected = df.select(["target_lru_pn", "amendment_name"]).unique().collect()
+    unique_lrus = collected["target_lru_pn"].unique().to_list()
+
+    print(f"✅ Rules loaded for {len(unique_lrus)} unique LRUs")
+    print(f"📋 LRU sample: {unique_lrus[:10]}")
+
+    # Check if the new LRU is present
+    new_lru = "35-0A5-2005-009"
+    if new_lru in unique_lrus:
+        print(f"✅ NEW LRU FOUND: {new_lru} is present in rules_amendments")
+        lru_rules = collected.filter(pl.col("target_lru_pn") == new_lru)
+        print(f"   Amendments for {new_lru}: {lru_rules['amendment_name'].unique().to_list()}")
+    else:
+        print(f"⚠️ WARNING: NEW LRU {new_lru} NOT FOUND in rules_amendments")
+        print(f"   Available LRUs: {sorted(unique_lrus)}")
+
     output.write_table(df)
