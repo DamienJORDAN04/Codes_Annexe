@@ -1,0 +1,56 @@
+"""
+Output Dataset: Amendment Nameplate Actions
+
+Ultra-lightweight dataset for nameplate actions display.
+Used for: "What do I stamp/cross-out on the nameplate?"
+
+OPTIMIZED FOR SCALE:
+- Only essential columns
+- Very small dataset (~10-50 rows total, one per rule)
+- Instant lookup
+
+v16.0: Removed 'supersedes', 'supersession_message', 'description' columns —
+       these fields no longer exist in the source data.
+
+Input: amendment_rules_summary
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_actions
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_actions"),
+    summary=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_rules_summary"),
+)
+def compute(summary: LightweightInput, output: LightweightOutput) -> None:
+    """
+    Minimal nameplate actions lookup.
+
+    Contains ONLY nameplate actions:
+    1. What to STAMP
+    2. What to CROSS OUT
+
+    Query pattern: WHERE target_lru_pn = 'LRU_X' AND rule_id = 'RULE_1'
+    """
+
+    df = summary.polars(lazy=True)
+
+    # Select ONLY essential columns
+    df_minimal = df.select(
+        [
+            # Keys
+            "target_lru_pn",
+            "rule_id",
+            # Actions
+            "nameplate_actions",
+            # Display
+            "visual_status",
+        ]
+    )
+
+    # Sort by LRU then rule
+    df_minimal = df_minimal.sort(["target_lru_pn", "rule_id"])
+
+    output.write_table(df_minimal)
