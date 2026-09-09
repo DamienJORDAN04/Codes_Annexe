@@ -1,1 +1,116 @@
 
+"""
+Business Logic: Amendment Rules Summary (amendment_calculator)
+
+Builds a summary table of amendment rules with nameplate actions.
+One row per (target_lru_pn, rule_id).
+
+Used by app_amendment_actions to display:
+- What to STAMP on the nameplate (amendment letter)
+- What to CROSS OUT (superseded amendments)
+
+v16.1: Uses amdt_name (was amendment_name in v15/v16.0).
+       supersedes and description now come from parsed_amendment_rules
+       (propagated from rules_amendments source).
+
+Input: parsed_amendment_rules
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_rules_summary
+"""
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+from transforms.api import Input, Output, transform
+
+
+@transform(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_rules_summary"),
+    parsed_rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
+)
+def compute(parsed_rules, output):
+    """
+    Summarises amendment rules for nameplate display.
+
+    For each (target_lru_pn, rule_id) produces:
+    - amdt_name       : amendment letter / "STD"
+    - description     : human-readable description
+    - supersedes      : comma-separated list of superseded amendments
+    - required_slots  : list of slot names required by this rule
+    - slot_count      : number of distinct slots
+    - nameplate_actions : formatted string of what to stamp / cross out
+    - visual_status   : display badge (e.g. "🟢 STD", "🟠 Amendment A")
+    """
+
+    df = parsed_rules.dataframe()
+
+    # ==========================================
+    # DEFENSIVE: handle both 'amdt_name' (v16.1) and 'amendment_name' (legacy)
+    # ==========================================
+    existing_cols = df.columns
+    if "amdt_name" not in existing_cols and "amendment_name" in existing_cols:
+        df = df.withColumnRenamed("amendment_name", "amdt_name")
+
+    for col_name in ("amdt_name", "warning_text", "description", "supersedes"):
+        if col_name not in df.columns:
+            df = df.withColumn(col_name, F.lit(None).cast(StringType()))
+
+    # Add helper column: does this rule have a context dependency?
+    df = df.withColumn(
+        "has_context",
+        F.col("context_pn").isNotNull(),
+    )
+
+    # Aggregate: one row per (target_lru_pn, rule_id)
+    df_summary = df.groupBy("target_lru_pn", "rule_id", "amdt_name", "description").agg(
+        F.collect_list("slot_name").alias("required_slots"),
+        F.collect_list("slot_rule_key").alias("slot_rule_keys"),
+        F.countDistinct("slot_name").alias("slot_count"),
+        F.sum(F.when(F.col("has_context"), 1).otherwise(0)).alias("context_dependent_slots"),
+        # Keep unit, warning_text, supersedes (same value for all rows of a rule)
+        F.first("unit").alias("unit"),
+        F.first("warning_text").alias("warning_text"),
+        F.first("supersedes").alias("supersedes"),
+    )
+
+    # Format required slots as comma-separated string
+    df_summary = df_summary.withColumn(
+        "required_slots_str",
+        F.concat_ws(", ", F.col("required_slots")),
+    )
+
+    # Build nameplate_actions string
+    # Format: "STAMP: <amdt_name> | CROSS OUT: <supersedes>"
+    df_summary = df_summary.withColumn(
+        "nameplate_actions",
+        F.when(
+            F.col("amdt_name") == "STD",
+            F.lit("STAMP: STD (no amendment)"),
+        ).when(
+            F.col("supersedes").isNotNull() & (F.col("supersedes") != ""),
+            F.concat(
+                F.lit("STAMP: "),
+                F.col("amdt_name"),
+                F.lit(" | CROSS OUT: "),
+                F.col("supersedes"),
+            ),
+        ).otherwise(
+            F.concat(F.lit("STAMP: "), F.col("amdt_name")),
+        ),
+    )
+
+    # Visual status badge
+    df_summary = df_summary.withColumn(
+        "visual_status",
+        F.when(F.col("amdt_name") == "STD", F.lit("🟢 STANDARD"))
+        .otherwise(F.concat(F.lit("🟠 Amendment "), F.col("amdt_name"))),
+    )
+
+    # Create rule key
+    df_summary = df_summary.withColumn(
+        "rule_key",
+        F.concat_ws("::", F.col("target_lru_pn"), F.col("rule_id")),
+    )
+
+    # Sort for consistent output
+    df_summary = df_summary.orderBy(["target_lru_pn", "rule_id"])
+
+    output.write_dataframe(df_summary)
