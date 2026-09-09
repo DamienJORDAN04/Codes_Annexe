@@ -1,0 +1,245 @@
+"""
+Intermediate Transform: S7 LRU Configuration
+
+Creates a normalized view of S7 data for LRU Configurator auto-fill.
+Extracts LRU PN, amendments, and card configuration from S7 notifications.
+
+Inputs:
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/s7_all
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/s7_lru_configuration
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/s7_lru_configuration"),
+    s7_all=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/s7_all"),
+    interchangeability=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability"),
+    avionics_parts=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"),
+)
+def compute(
+    s7_all: LightweightInput,
+    interchangeability: LightweightInput,
+    avionics_parts: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Extract and normalize S7 notification data for LRU Configurator.
+
+    Transformations:
+    1. Normalize notification numbers (remove leading zeros)
+    2. Identify LRU PN from ENSEMBLE_SUPERIEUR or MATERIAL_NUMBER_FINAL
+    3. Extract amendments from AMENDMENT_RECEIVED
+    4. Link to interchangeability for LRU validation
+    5. Create lookup keys for fast search
+    """
+
+    df_s7 = s7_all.polars(lazy=True)
+    df_interch = interchangeability.polars(lazy=True)
+    df_parts = avionics_parts.polars(lazy=True)
+
+    # === STEP 1: Normalize notification number ===
+    # Create both versions: with and without leading zeros
+    df = df_s7.with_columns(
+        [
+            # Original notification number
+            pl.col("notification_number").alias("notification_number_original"),
+            # Normalized (remove leading zeros)
+            pl.col("notification_number").str.replace("^0+", "").alias("notification_number_normalized"),
+        ]
+    )
+
+    # === STEP 2: Identify LRU PN ===
+    # Priority: ENSEMBLE_SUPERIEUR > MATERIAL_NUMBER_FINAL
+    # Check if these are LRU (in applicable_lru_pn from interchangeability)
+
+    # Get list of valid LRU PNs from interchangeability
+    lru_pns = (
+        df_interch.select(pl.col("applicable_lru_pn").alias("lru_pn"))
+        .unique()
+        .filter(pl.col("lru_pn").is_not_null() & (pl.col("lru_pn") != ""))
+        .collect()
+    )
+
+    valid_lru_set = set(lru_pns["lru_pn"].to_list())
+
+    # Determine LRU PN with priority logic
+    df = df.with_columns(
+        [
+            # Try ENSEMBLE_SUPERIEUR first
+            pl.when(pl.col("ensemble_superieur").is_in(valid_lru_set))
+            .then(pl.col("ensemble_superieur"))
+            # Fallback to MATERIAL_NUMBER_FINAL if it's a valid LRU
+            .when(pl.col("material_number_final").is_in(valid_lru_set))
+            .then(pl.col("material_number_final"))
+            # Otherwise null
+            .otherwise(None)
+            .alias("lru_pn"),
+        ]
+    )
+
+    # === STEP 3: Extract card PN (SRU) ===
+    # Priority: MATERIAL_NUMBER_RECEIVED > MATERIAL_NUMBER_FINAL (if not LRU)
+    df = df.with_columns(
+        [
+            pl.when(pl.col("material_number_received").is_not_null())
+            .then(pl.col("material_number_received"))
+            .when(pl.col("material_number_final").is_not_null() & ~pl.col("material_number_final").is_in(valid_lru_set))
+            .then(pl.col("material_number_final"))
+            .otherwise(None)
+            .alias("card_pn"),
+        ]
+    )
+
+    # === STEP 4: Parse amendments ===
+    # AMENDMENT_RECEIVED peut contenir: "A", "A,B", "A B", ou des lettres ACCOLÉES
+    # sans séparateur, p.ex. "EIJKL" (== E, I, J, K, L).
+    #
+    # ✅ FIX ("EIJKL"): la règle métier est 1 amendement = 1 LETTRE. On normalise
+    # amendments_raw en une chaîne "E,I,J,K,L" où chaque lettre est un amendement
+    # distinct. Étapes :
+    #   1. Mettre en MAJUSCULES.
+    #   2. Supprimer le mot entier "STD" (sinon il serait éclaté en S,T,D).
+    #   3. Extraire chaque lettre A-Z individuellement (extract_all), ce qui gère
+    #      d'un coup les lettres collées ("EIJKL") ET les séparateurs (",", " ",
+    #      "/", ";", "|", etc. sont simplement ignorés car non alphabétiques).
+    #   4. Rejoindre par des virgules.
+    # Exemples : "EIJKL" -> "E,I,J,K,L" ; "E,I J" -> "E,I,J" ; "STD" -> "".
+    # NB : lookaround non supporté par le moteur regex de Polars -> on utilise
+    #      extract_all (approche compatible). Valide car 1 amendement = 1 lettre.
+    df = df.with_columns(
+        [
+            pl.col("amendment_received")
+            .str.to_uppercase()
+            .str.replace_all(r"STD", "")  # ne pas éclater STD en S,T,D
+            .str.extract_all(r"[A-Z]")  # ['E','I','J','K','L']
+            .list.join(",")  # 'E,I,J,K,L'
+            .alias("amendments_raw"),
+        ]
+    )
+
+    # === STEP 5: Join with parts catalog for display names ===
+    df_parts_subset = df_parts.select(
+        [
+            pl.col("part_number"),
+            pl.col("display_name"),
+            pl.col("designation"),
+            pl.col("module_type"),
+        ]
+    ).collect()
+
+    # Join for LRU info
+    df = df.join(
+        df_parts_subset.select(
+            [
+                pl.col("part_number").alias("lru_pn"),
+                pl.col("display_name").alias("lru_display_name"),
+                pl.col("designation").alias("lru_designation"),
+            ]
+        ).lazy(),
+        on="lru_pn",
+        how="left",
+    )
+
+    # Join for Card info
+    df = df.join(
+        df_parts_subset.select(
+            [
+                pl.col("part_number").alias("card_pn"),
+                pl.col("display_name").alias("card_display_name"),
+                pl.col("designation").alias("card_designation"),
+                pl.col("module_type").alias("card_module_type"),
+            ]
+        ).lazy(),
+        on="card_pn",
+        how="left",
+    )
+
+    # === STEP 6: Create lookup keys ===
+    df = df.with_columns(
+        [
+            # Composite key for fast lookup: "NOTIFICATION::LRU_PN"
+            (pl.col("notification_number_normalized") + "::" + pl.col("lru_pn").fill_null("UNKNOWN")).alias(
+                "lookup_key"
+            ),
+            # Search key (just notification for flexibility)
+            pl.col("notification_number_normalized").alias("search_key"),
+        ]
+    )
+
+    # === STEP 7: Add metadata ===
+    df = df.with_columns(
+        [
+            # Has LRU identified?
+            pl.col("lru_pn").is_not_null().alias("has_lru"),
+            # Has card identified?
+            pl.col("card_pn").is_not_null().alias("has_card"),
+            # Has amendments?
+            pl.col("amendments_raw").is_not_null().alias("has_amendments"),
+            # Status flag
+            pl.when(pl.col("lru_pn").is_not_null() & pl.col("card_pn").is_not_null())
+            .then(pl.lit("COMPLETE"))
+            .when(pl.col("lru_pn").is_not_null())
+            .then(pl.lit("LRU_ONLY"))
+            .when(pl.col("card_pn").is_not_null())
+            .then(pl.lit("CARD_ONLY"))
+            .otherwise(pl.lit("INCOMPLETE"))
+            .alias("data_completeness"),
+        ]
+    )
+
+    # === STEP 8: Select final columns ===
+    df = df.select(
+        [
+            # Identification
+            "notification_number_original",
+            "notification_number_normalized",
+            "search_key",
+            "lookup_key",
+            # LRU Information
+            "lru_pn",
+            "lru_display_name",
+            "lru_designation",
+            "ensemble_superieur_serial_number",
+            # Card Information
+            "card_pn",
+            "card_display_name",
+            "card_designation",
+            "card_module_type",
+            "serial_number",
+            # Amendments
+            "amendments_raw",
+            "amendment_received",
+            # Context
+            "creation_date",
+            "closing_date",
+            "equipment_number",
+            "equipment_desc_fr",
+            "msn",
+            "immat",
+            "client_name",
+            # Status
+            "has_lru",
+            "has_card",
+            "has_amendments",
+            "data_completeness",
+            # Additional technical info
+            "fault_code",
+            "fault_designation",
+            "removal_reason",
+            "realised_task",
+        ]
+    )
+
+    # Filter: Keep only records with at least LRU or Card identified
+    df = df.filter(pl.col("has_lru") | pl.col("has_card"))
+
+    # Sort by notification number (most recent first)
+    df = df.sort("notification_number_normalized", descending=True)
+
+    output.write_table(df)
