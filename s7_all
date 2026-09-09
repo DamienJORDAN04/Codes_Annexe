@@ -1,0 +1,145 @@
+"""
+Source Transform: S7 All Dataset
+
+Imports the S7 All dataset as a source for the configuration management system.
+Filters only records where part numbers (PN) match LRU or SRU in the interchangeability database.
+
+Input:
+  - ri.foundry.main.dataset.a548b5b5-aaff-4e25-94b1-9a19c2d036b6 (S7 All)
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/s7_all
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/s7_all"),
+    s7_source=Input("ri.foundry.main.dataset.a548b5b5-aaff-4e25-94b1-9a19c2d036b6"),
+    interchangeability=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/interchangeability"),
+)
+def compute(
+    s7_source: LightweightInput,
+    interchangeability: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Import and filter the S7 All dataset to keep only records matching LRU/SRU in interchangeability.
+
+    Filtering logic:
+    - Keep records where MATERIAL_NUMBER_FINAL matches any PN in interchangeability
+      (old_pn, new_pn, or applicable_lru_pn)
+    - Keep records where MATERIAL_NUMBER_RECEIVED matches any PN in interchangeability
+    """
+
+    # Read the S7 dataset
+    df_s7 = s7_source.polars(lazy=True)
+
+    # Read interchangeability to extract all unique PNs (LRU/SRU)
+    df_interch = interchangeability.polars(lazy=True)
+
+    # Create a unified list of all PNs from interchangeability
+    # We'll collect: old_pn, new_pn, and applicable_lru_pn
+    valid_pns = (
+        pl.concat(
+            [
+                df_interch.select(pl.col("old_pn").alias("pn")),
+                df_interch.select(pl.col("new_pn").alias("pn")),
+                df_interch.select(pl.col("applicable_lru_pn").alias("pn")),
+            ]
+        )
+        .unique()
+        .filter(pl.col("pn").is_not_null() & (pl.col("pn") != ""))
+        .collect()
+    )
+
+    # Get the list of valid PNs as a set for filtering
+    valid_pn_set = set(valid_pns["pn"].to_list())
+
+    # Standardize column names to snake_case
+    df_s7 = df_s7.rename(
+        {
+            "NOTIFICATION_NUMBER": "notification_number",
+            "CREATION_DATE": "creation_date",
+            "MATERIAL_NUMBER_FINAL": "material_number_final",
+            "MATERIAL_DESC_FR": "material_desc_fr",
+            "CUSTOMER_PURCHASE_ORDER_NUMBER": "customer_purchase_order_number",
+            "SERIAL_NUMBER": "serial_number",
+            "CLOSING_DATE": "closing_date",
+            "REQUIRED_START_DATE": "required_start_date",
+            "REQUIRED_END_DATE": "required_end_date",
+            "START_OF_MALFUNCTION": "start_of_malfunction",
+            "REQUIRED_START_TIME": "required_start_time",
+            "REQUIRED_END_TIME": "required_end_time",
+            "ORDER_NUMBER": "order_number",
+            "EQUIPMENT_NUMBER": "equipment_number",
+            "EQUIPMENT_DESC_FR": "equipment_desc_fr",
+            "GUARANTEE_START_DATE": "guarantee_start_date",
+            "GUARANTEE_END_DATE": "guarantee_end_date",
+            "WORK_CENTER": "work_center",
+            "LOGISTICALGROUP": "logistical_group",
+            "MATERIAL_NUMBER_RECEIVED": "material_number_received",
+            "AMENDMENT_RECEIVED": "amendment_received",
+            "IMMAT": "immat",
+            "MSN": "msn",
+            "OTHER_FAILURE": "other_failure",
+            "NORME_USE": "norme_use",
+            "ENSEMBLE_SUPERIEUR": "ensemble_superieur",
+            "CONFIRMED_FAILURE": "confirmed_failure",
+            "ENSEMBLE_SUPERIEUR_SERIAL_NUMBER": "ensemble_superieur_serial_number",
+            "REQUIRED_TASK": "required_task",
+            "REALISED_TASK": "realised_task",
+            "REMOVAL_REASON": "removal_reason",
+            "CLIENT_NAME": "client_name",
+            "SYSTEM_CODE": "system_code",
+            "USER_CODE": "user_code",
+            "ITEM_NUMBER_IN_ITEM_RECORD": "item_number_in_item_record",
+            "FAULT_CODE": "fault_code",
+            "FAULT_DESIGNATION": "fault_designation",
+            "DESIGNA_PN_OUCMS_ARTI_REMONTE": "designa_pn_oucms_arti_remonte",
+            "DESIGNA_SE_DEMONTE_OU_REPARE": "designa_se_demonte_ou_repare",
+            "ELEC_REPA_ART_CI": "elec_repa_art_ci",
+            "ELEC_REPA_CMS_SOURCE": "elec_repa_cms_source",
+            "ELEC_REPA_CODE_EXPERTISE": "elec_repa_code_expertise",
+            "ELEC_REPA_CODE_FAMILLE": "elec_repa_code_famille",
+            "ELEC_REPA_CONFIRMATION": "elec_repa_confirmation",
+            "ELEC_REPA_DATE_CODE_CI": "elec_repa_date_code_ci",
+            "ELEC_REPA_DATE_CODE_COMPOSANT": "elec_repa_date_code_composant",
+            "ELEC_REPA_FABRICANT_CI": "elec_repa_fabricant_ci",
+            "ELEC_REPA_FABR_FOURNISSEUR": "elec_repa_fabr_fournisseur",
+            "ELEC_REPA_NOM_EXPERT": "elec_repa_nom_expert",
+            "ELEC_REPA_REFERENCE_FABRICANT": "elec_repa_reference_fabricant",
+            "IHM_AVIS_SEC": "ihm_avis_sec",
+            "IHM_COMMANDE_COMPOSANT": "ihm_commande_composant",
+            "IHM_DIVISION": "ihm_division",
+            "IHM_MAGASIN": "ihm_magasin",
+            "NUM_LOT_COMPOSANT_REMONTE": "num_lot_composant_remonte",
+            "OPERATION_REALISEE": "operation_realisee",
+            "PN_OU_CMS_ARTICLE_REMONTE": "pn_ou_cms_article_remonte",
+            "PN_SE_DEMONTE_OU_REPARE": "pn_se_demonte_ou_repare",
+            "QUANTITE_REMONTEE": "quantite_remontee",
+            "REPERE_TOPOGRAPHIQUE": "repere_topographique",
+            "SELECTIONNER_POUR_IMPRESSION": "selectionner_pour_impression",
+            "SN_SE_DEMONTE_OU_REPARE": "sn_se_demonte_ou_repare",
+            "SN_SE_REMONTE": "sn_se_remonte",
+        }
+    )
+
+    # Filter: Keep only records where material_number_final OR material_number_received
+    # is in the valid_pn_set from interchangeability
+    df_filtered = df_s7.filter(
+        pl.col("material_number_final").is_in(valid_pn_set) | pl.col("material_number_received").is_in(valid_pn_set)
+    )
+
+    # Add flag columns to indicate match type
+    df_filtered = df_filtered.with_columns(
+        [
+            pl.col("material_number_final").is_in(valid_pn_set).alias("final_pn_in_interch"),
+            pl.col("material_number_received").is_in(valid_pn_set).alias("received_pn_in_interch"),
+        ]
+    )
+
+    # Write the filtered output
+    output.write_table(df_filtered)
