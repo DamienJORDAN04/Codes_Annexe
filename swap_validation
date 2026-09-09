@@ -15,7 +15,8 @@ NOW WITH:
 FAMILY MATCHING:
 - Extracts first 6 characters as lru_family (LA2K2B, 350E05)
 - All LRUs in same family share same group rules
-- Example: LA2K2B1002C0000 and LA2K2B100DR0000 both match LA2K2B::PSM_COM
+
+v16.0: Removed 'all_supersedes' → 'supersedes' renaming — supersedes no longer exists in source.
 
 Input: configuration_matrix (with physical slots), slot_groups_metadata
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation
@@ -107,15 +108,12 @@ def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, outp
     )
 
     # FAMILY-BASED JOIN FOR SLOT GROUPS
-    # Extract LRU family (first 6 characters: LA2K2B, 350E05, etc.)
     df = df.with_columns([pl.col("applicable_lru_pn").str.slice(0, 6).alias("lru_family")])
 
-    # Create family-based join key
     df = df.with_columns(
         [pl.concat_str([pl.col("lru_family"), pl.lit("::"), pl.col("physical_slot_name")]).alias("slot_key_family")]
     )
 
-    # Prepare slot_groups for join (use family key)
     df_groups_for_join = df_groups.select(
         [
             "slot_key_family",
@@ -129,7 +127,6 @@ def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, outp
         ]
     )
 
-    # Left join on family key
     df = df.join(df_groups_for_join, left_on="slot_key_family", right_on="slot_key_family", how="left")
 
     # Add group flags
@@ -209,7 +206,7 @@ def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, outp
         ]
     )
 
-    # Select final columns - RENAME all_supersedes back to supersedes for output compatibility
+    # Select final columns - UPDATED: Use dd_issue from configuration_matrix
     df = df.select(
         [
             "validation_key",
@@ -233,7 +230,7 @@ def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, outp
             "amendment_requirement",
             # Amendment
             "amendment_letter",
-            pl.col("all_supersedes").alias("supersedes"),  # RENAME: all_supersedes → supersedes for output
+            "dd_issue",  # UPDATED: replaced supersedes with dd_issue
             "swap_logic_json",
             "impact_category",
             # Stock
@@ -248,8 +245,8 @@ def compute(config_matrix: LightweightInput, slot_groups: LightweightInput, outp
             "has_stock_neuf",
             "has_stock_occa",
             "swap_available",
-            # Part metadata (NEW: production status)
-            "pn_in_production",  # ✅ ADD: Production status from enriched_parts
+            # Part metadata
+            "pn_in_production",
             "in_service",
             "procurable",
             "repairable",
