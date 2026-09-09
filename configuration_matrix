@@ -7,6 +7,11 @@ This is the core dataset that powers the configuration validation.
 NOW WITH REAL STOCK DATA (NEUF/OCCA) from daily stock updates.
 NOW WITH EXPANDED SLOTS (JEU D'OBRM → OBRM_COM/OBRM_MON, PSC → PSM_COM/PSM_MON)
 
+v16.0: 'all_supersedes' column from interchangeability CSV is kept as-is here
+       (it comes from the interchangeability source, not from amendment rules).
+       However it is no longer renamed/forwarded as 'supersedes' downstream
+       (validate_interchangeability.py v16.0 removes that alias).
+
 Inputs:
   - interchangeability_expanded (with physical slot names)
   - enriched_parts (with real stock_neuf, stock_occa, pn_in_production)
@@ -246,7 +251,7 @@ def compute(
             "verdict_type",
             "amendment_letter",
             "swap_logic_json",
-            "all_supersedes",
+            "dd_issue",  # Updated: replaced all_supersedes with dd_issue
             # Keys
             "swap_key",
             "expanded_swap_key",
