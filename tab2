@@ -6,12 +6,15 @@ with tab2:
         st.session_state.selected_card_pn_v2 = None
     if "selected_lru_pn_v2" not in st.session_state:
         st.session_state.selected_lru_pn_v2 = None
+    if "search_without_lru_mode" not in st.session_state:
+        st.session_state.search_without_lru_mode = False
 
     search_term = st.text_input(
         "🔍 Enter Part Number:", placeholder="e.g., 0271112380, LA1E01003H36100", key="search_input"
     )
 
-    if search_term:
+    # ✅ FIX: Only load datasets if search_term is not empty and has at least 3 characters
+    if search_term and len(search_term.strip()) >= 3:
         with st.spinner("⏳ Loading datasets..."):
             df_sru = load_sru_search()
             df_slots = load_slot_options()
@@ -92,87 +95,228 @@ with tab2:
                     if not results.empty:
                         st.success(f"📊 {len(results)} result(s) found")
 
+                        # ✅ FIXED: Button for search without LRU - only show if NOT already in that mode
+                        if not st.session_state.search_without_lru_mode:
+                            st.markdown("---")
+                            col_btn1, col_btn2 = st.columns([2, 6])
+                            with col_btn1:
+                                if st.button(
+                                    "🔍 Search Without LRU",
+                                    type="primary",
+                                    help="Find all interchangeable cards without selecting a specific LRU",
+                                ):
+                                    st.session_state.search_without_lru_mode = True
+                                    st.rerun()
+                            st.markdown("---")
+
                         # ==========================================
-                        # ANALYSE DIRECTE: Prendre la première carte trouvée
+                        # NEW MODE: Search Without LRU
                         # ==========================================
-                        first_result = results.iloc[0]
-                        selected_pn = first_result["new_pn"]
+                        if st.session_state.search_without_lru_mode:
+                            # Show back button at the top
+                            if st.button("↩️ Back to Normal Search", type="secondary"):
+                                st.session_state.search_without_lru_mode = False
+                                st.session_state.selected_lru_pn_v2 = None
+                                st.rerun()
+                            
+                            st.markdown("---")
+                            first_result = results.iloc[0]
+                            selected_pn = first_result["new_pn"]
 
-                        st.markdown("---")
-                        st.markdown(f"## 🔍 Analysis for: `{selected_pn}`")
+                            st.markdown("---")
+                            st.markdown(f"## 🔍 Interchangeable Cards for: `{selected_pn}`")
+                            st.info(
+                                "ℹ️ **Search Without LRU Mode** - Showing all interchangeable cards (no amendment analysis)"
+                            )
 
-                        # ✅ v15.2.0: Pass df_lru_stock to get LRU names and stock
-                        compatible_lrus = get_compatible_lrus_for_pn(selected_pn, df_slots, df_lru_stock)
+                            # Get all cards with same slot (interchangeable)
+                            card_info = df_slots[df_slots["new_pn"] == selected_pn]
 
-                        if compatible_lrus:
-                            st.markdown("### 📦 Compatible LRUs")
+                            if not card_info.empty:
+                                slot_name = card_info.iloc[0].get("physical_slot_name", "Unknown")
 
-                            for lru_idx, lru_info in enumerate(compatible_lrus):
-                                lru_pn = lru_info["lru_pn"]
-                                slot_name = lru_info["slot_name"]
+                                # Find all cards with same slot name (interchangeable)
+                                all_interchangeable = df_slots[df_slots["physical_slot_name"] == slot_name].copy()
+
+                                if not all_interchangeable.empty:
+                                    # Ensure columns exist
+                                    if "stock_neuf" not in all_interchangeable.columns:
+                                        all_interchangeable["stock_neuf"] = 0
+                                    if "stock_occa" not in all_interchangeable.columns:
+                                        all_interchangeable["stock_occa"] = 0
+
+                                    all_interchangeable["stock_neuf"] = (
+                                        all_interchangeable["stock_neuf"].fillna(0).astype(int)
+                                    )
+                                    all_interchangeable["stock_occa"] = (
+                                        all_interchangeable["stock_occa"].fillna(0).astype(int)
+                                    )
+                                    all_interchangeable["stock_total"] = (
+                                        all_interchangeable["stock_neuf"] + all_interchangeable["stock_occa"]
+                                    )
+
+                                    # Add production flag
+                                    if "pn_in_production" not in all_interchangeable.columns:
+                                        all_interchangeable["pn_in_production"] = "No"
+                                    all_interchangeable["prod_priority"] = all_interchangeable[
+                                        "pn_in_production"
+                                    ].apply(lambda x: 0 if str(x).lower() == "yes" else 1)
+
+                                    # Sort: production → stock → PN
+                                    all_interchangeable = all_interchangeable.sort_values(
+                                        by=["prod_priority", "stock_total", "new_pn"], ascending=[True, False, True]
+                                    )
+
+                                    # Remove duplicates
+                                    all_interchangeable = all_interchangeable.drop_duplicates(
+                                        subset=["new_pn", "applicable_lru_pn"]
+                                    )
+
+                                    st.markdown(
+                                        f"### 📦 Cards Available - Slot: `{slot_name}`"
+                                    )
+
+                                    # Group by card PN
+                                    grouped = all_interchangeable.groupby("new_pn")
+
+                                    for card_pn, group in grouped:
+                                        is_current = card_pn == selected_pn
+                                        current_indicator = "👉 " if is_current else ""
+
+                                        # Get card info
+                                        first_card = group.iloc[0]
+                                        card_designation = first_card.get("designation", "N/A")
+                                        stock_neuf = int(first_card.get("stock_neuf", 0))
+                                        stock_occa = int(first_card.get("stock_occa", 0))
+                                        stock_total = stock_neuf + stock_occa
+                                        in_production = str(first_card.get("pn_in_production", "No")).lower() == "yes"
+
+                                        # Get all LRUs for this card
+                                        lru_list = []
+                                        for _, row in group.iterrows():
+                                            lru_pn = row.get("applicable_lru_pn")
+                                            if lru_pn and pd.notna(lru_pn):
+                                                # Get LRU name
+                                                lru_name = "Unknown"
+                                                if lru_pn in df_lru_stock.index:
+                                                    lru_row = df_lru_stock.loc[lru_pn]
+                                                    if isinstance(lru_row, pd.DataFrame):
+                                                        lru_row = lru_row.iloc[0]
+                                                    lru_name = str(lru_row.get("unit", "Unknown"))
+                                                lru_list.append(f"{lru_name} ({lru_pn})")
+
+                                        # Display card
+                                        if in_production:
+                                            label = f"{current_indicator}**{card_pn}** - {card_designation} - Stock: NEUF {stock_neuf} | OCCA {stock_occa}"
+                                        else:
+                                            label = f"{current_indicator}{card_pn} - {card_designation} - Stock: NEUF {stock_neuf} | OCCA {stock_occa}"
+
+                                        with st.expander(label, expanded=False):
+                                            if in_production:
+                                                st.markdown(
+                                                    '<div style="color:#008800;font-weight:bold;padding:5px;border-radius:3px;text-align:center">⭐ IN PRODUCTION</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+
+                                            st.markdown(f"**Designation:** {card_designation}")
+                                            st.markdown(
+                                                f"**Stock:** NEUF {stock_neuf} | OCCA {stock_occa} | Total: {stock_total}"
+                                            )
+
+                                            st.markdown("---")
+                                            st.markdown(f"**📍 Compatible LRUs ({len(lru_list)}):**")
+                                            for lru_display in lru_list:
+                                                st.markdown(f"• {lru_display}")
+                                else:
+                                    st.warning("No interchangeable cards found")
+                            else:
+                                st.warning(f"Card `{selected_pn}` not found in database")
+
+                        # ==========================================
+                        # ORIGINAL MODE: With LRU Selection
+                        # ==========================================
+                        else:
+                            # ==========================================
+                            # ANALYSE DIRECTE: Prendre la première carte trouvée
+                            # ==========================================
+                            first_result = results.iloc[0]
+                            selected_pn = first_result["new_pn"]
+
+                            st.markdown("---")
+                            st.markdown(f"## 🔍 Analysis for: `{selected_pn}`")
+
+                            # ✅ v15.2.0: Pass df_lru_stock to get LRU names and stock
+                            compatible_lrus = get_compatible_lrus_for_pn(selected_pn, df_slots, df_lru_stock)
+
+                            if compatible_lrus:
+                                st.markdown("### 📦 Compatible LRUs")
+
+                                for lru_idx, lru_info in enumerate(compatible_lrus):
+                                    lru_pn = lru_info["lru_pn"]
+                                    slot_name = lru_info["slot_name"]
 
                                 is_lru_selected = st.session_state.selected_lru_pn_v2 == lru_pn
 
                                 col1, col2, col3 = st.columns([1, 4, 3])
 
                                 with col1:
-                                    if st.button(
-                                        "✓" if is_lru_selected else "Select",
-                                        key=f"lru_sel_{lru_idx}",
-                                        type="primary" if is_lru_selected else "secondary",
-                                    ):
-                                        if is_lru_selected:
-                                            st.session_state.selected_lru_pn_v2 = None
-                                        else:
-                                            st.session_state.selected_lru_pn_v2 = lru_pn
-                                        st.rerun()
+                                        if st.button(
+                                            "✓" if is_lru_selected else "Select",
+                                            key=f"lru_sel_{lru_idx}",
+                                            type="primary" if is_lru_selected else "secondary",
+                                        ):
+                                            if is_lru_selected:
+                                                st.session_state.selected_lru_pn_v2 = None
+                                            else:
+                                                st.session_state.selected_lru_pn_v2 = lru_pn
+                                            st.rerun()
 
                                 with col2:
-                                    # ✅ v15.2.0: Display LRU name + PN
-                                    unit = lru_info.get("unit", "Unknown LRU")
-                                    st.markdown(f"**{unit}** (`{lru_pn}`) - Slot: {slot_name}")
+                                        # ✅ v15.2.0: Display LRU name + PN
+                                        unit = lru_info.get("unit", "Unknown LRU")
+                                        st.markdown(f"**{unit}** (`{lru_pn}`) - Slot: {slot_name}")
 
                                 with col3:
-                                    # ✅ v15.2.0: Display real LRU stock
-                                    lru_stock_summary = lru_info.get("lru_stock_summary", "❌ No stock data")
-                                    st.caption(lru_stock_summary)
+                                        # ✅ v15.2.0: Display real LRU stock
+                                        lru_stock_summary = lru_info.get("lru_stock_summary", "❌ No stock data")
+                                        st.caption(lru_stock_summary)
 
-                            # ==========================================
-                            # STEP 3: Detailed Analysis for Selected LRU
-                            # ==========================================
-                            if st.session_state.selected_lru_pn_v2:
-                                selected_lru = st.session_state.selected_lru_pn_v2
+                                # ==========================================
+                                # STEP 3: Detailed Analysis for Selected LRU
+                                # ==========================================
+                                if st.session_state.selected_lru_pn_v2:
+                                    selected_lru = st.session_state.selected_lru_pn_v2
 
-                                selected_lru_info = next(
-                                    (lru for lru in compatible_lrus if lru["lru_pn"] == selected_lru), None
-                                )
-
-                                if selected_lru_info:
-                                    slot_name = selected_lru_info["slot_name"]
-
-                                    st.markdown("---")
-                                    st.markdown(
-                                        f"### 🎯 Configuration Analysis: `{selected_pn}` in LRU `{selected_lru}`"
+                                    selected_lru_info = next(
+                                        (lru for lru in compatible_lrus if lru["lru_pn"] == selected_lru), None
                                     )
 
-                                    amendment_info = get_amendment_for_card_in_lru(
-                                        selected_pn, selected_lru, slot_name, df_slots, df_amendment_rules
-                                    )
+                                    if selected_lru_info:
+                                        slot_name = selected_lru_info["slot_name"]
+
+                                        st.markdown("---")
+                                        st.markdown(
+                                            f"### 🎯 Configuration Analysis: `{selected_pn}` in LRU `{selected_lru}`"
+                                        )
+
+                                        amendment_info = get_amendment_for_card_in_lru(
+                                            selected_pn, selected_lru, slot_name, df_slots, df_amendment_rules
+                                        )
 
                                     if amendment_info:
-                                        amendment = amendment_info["amendment"]
-                                        is_full = amendment_info["is_full_interchangeable"]
-                                        mandatory_count = amendment_info["mandatory_slots_count"]
-                                        mandatory_slots = amendment_info["mandatory_slots"]
+                                            amendment = amendment_info["amendment"]
+                                            is_full = amendment_info["is_full_interchangeable"]
+                                            mandatory_count = amendment_info["mandatory_slots_count"]
+                                            mandatory_slots = amendment_info["mandatory_slots"]
 
-                                        # ✅ v15.2.8: Get ALL amendments for the selected card
-                                        card_info_all_amdts = df_slots[
-                                            (df_slots["applicable_lru_pn"] == selected_lru)
-                                            & (df_slots["new_pn"] == selected_pn)
-                                        ]
+                                            # ✅ v15.2.8: Get ALL amendments for the selected card
+                                            card_info_all_amdts = df_slots[
+                                                (df_slots["applicable_lru_pn"] == selected_lru)
+                                                & (df_slots["new_pn"] == selected_pn)
+                                            ]
 
-                                        all_amendments_display = "STD"
-                                        if not card_info_all_amdts.empty:
+                                            all_amendments_display = "STD"
+                                    if not card_info_all_amdts.empty:
                                             card_row_all = card_info_all_amdts.iloc[0]
                                             card_amdt_letter_all = card_row_all.get("amendment_letter", "")
                                             card_all_amdts_list = parse_amendment_letter(card_amdt_letter_all)
@@ -182,11 +326,11 @@ with tab2:
                                             else:
                                                 all_amendments_display = "STD"
 
-                                        st.markdown("#### 🎯 Amendment Impact")
+                                            st.markdown("#### 🎯 Amendment Impact")
 
-                                        col_amdt, col_interch = st.columns(2)
+                                            col_amdt, col_interch = st.columns(2)
 
-                                        with col_amdt:
+                                    with col_amdt:
                                             if all_amendments_display == "STD":
                                                 st.markdown(
                                                     '<div class="blue-banner">📌 Amendment Required: STD (Standard)</div>',
@@ -198,7 +342,7 @@ with tab2:
                                                     unsafe_allow_html=True,
                                                 )
 
-                                        with col_interch:
+                                    with col_interch:
                                             if is_full:
                                                 st.markdown(
                                                     '<div class="green-banner">✅ Full Interchangeable with the same PN<br>⚠️ If replacing the card with a different PN, please verify the conditions.</div>',
@@ -212,12 +356,12 @@ with tab2:
 
                                         # ✅ v15.2.8: NEW - Expander for detailed conditions
                                         # Get all amendments for the selected card
-                                        card_info_for_expander = df_slots[
+                                            card_info_for_expander = df_slots[
                                             (df_slots["applicable_lru_pn"] == selected_lru)
                                             & (df_slots["new_pn"] == selected_pn)
                                         ]
 
-                                        if not card_info_for_expander.empty:
+                                    if not card_info_for_expander.empty:
                                             card_row_expander = card_info_for_expander.iloc[0]
                                             card_amdt_letter_expander = card_row_expander.get("amendment_letter", "")
                                             card_all_amdts_expander = parse_amendment_letter(card_amdt_letter_expander)
@@ -502,17 +646,17 @@ with tab2:
                                                 with st.expander("📋 Conditions for Amendment STD", expanded=False):
                                                     st.info("✅ STD (Standard) - No additional conditions required")
 
-                                        st.markdown("---")
-                                        st.markdown(f"#### 🔄 Other Cards for Slot `{slot_name}`")
+                                            st.markdown("---")
+                                            st.markdown(f"#### 🔄 Other Cards for Slot `{slot_name}`")
 
-                                        other_cards = get_other_cards_in_slot(selected_lru, slot_name, df_slots)
+                                            other_cards = get_other_cards_in_slot(selected_lru, slot_name, df_slots)
 
-                                        if not other_cards.empty:
-                                            st.info(
+                                    if not other_cards.empty:
+                                                st.info(
                                                 f"**{len(other_cards)} card(s) available** for this slot (sorted: production → stock)"
                                             )
 
-                                            for _, card_row in other_cards.iterrows():
+                                    for _, card_row in other_cards.iterrows():
                                                 card_pn = card_row["new_pn"]
                                                 is_current = card_pn == selected_pn
                                                 in_production = (
@@ -546,7 +690,7 @@ with tab2:
                                                 with st.expander(label_text, expanded=False):
                                                     if in_production:
                                                         st.markdown(
-                                                            '<div style="background-color:#ffd700;padding:5px;border-radius:3px;text-align:center">⭐ IN PRODUCTION</div>',
+                                                            '<div style="color:#008800;font-weight:bold;padding:5px;border-radius:3px;text-align:center">⭐ IN PRODUCTION</div>',
                                                             unsafe_allow_html=True,
                                                         )
 
@@ -959,10 +1103,11 @@ with tab2:
                                                                     "No description available for this amendment"
                                                                 )
 
-                                        st.markdown("---")
+                                    st.markdown("---")
 
                                         # ✅ v15.2.6: Different behavior for BLC/BMC vs other cards
-                                        if slot_name in ["BLC", "BMC"]:
+                                        
+                                if slot_name in ["BLC", "BMC"]:
                                             st.markdown("#### 🏗️ Next Higher Assembly (NHA) - Level 1 (WIRED_ASSY)")
                                             # For BLC/BMC: Filter by selected LRU to show only WIRED_ASSY in this LRU
                                             nhas_level_1 = get_nha_level_1(
@@ -972,14 +1117,14 @@ with tab2:
                                                 lru_pn=selected_lru,
                                                 df_lru_stock=df_lru_stock,
                                             )
-                                        else:
+                                else:
                                             st.markdown("#### 🏗️ Compatible LRUs")
                                             # For other cards: Show ALL LRUs where this card can be installed
                                             nhas_level_1 = get_nha_level_1(
                                                 selected_pn, slot_name, df_slots, lru_pn=None, df_lru_stock=df_lru_stock
                                             )
 
-                                        if nhas_level_1:
+                                if nhas_level_1:
                                             for nha in nhas_level_1:
                                                 nha_pn = nha["nha_pn"]
                                                 nha_name = nha.get("nha_name", "Unknown")
@@ -1097,12 +1242,12 @@ with tab2:
                                                             )
                                                 else:
                                                     st.info("No NHA Level 2 data available")
-                                        else:
-                                            st.info("No NHA Level 1 data available")
+                                else:
+                                    st.info("No NHA Level 1 data available")
                                     else:
                                         st.error("❌ Could not retrieve amendment information for this card")
-                        else:
-                            st.warning("No compatible LRUs found for this card")
+                            else:
+                                st.warning("No compatible LRUs found for this card")
                     else:
                         st.warning(f"No results found for '{search_term}'")
                 else:
@@ -1110,4 +1255,5 @@ with tab2:
         else:
             st.error("❌ Failed to load LRU stock data. Please check your connection.")
     else:
-        st.info("👆 Enter a Part Number to search")
+        st.info("👆 Enter a Part Number to search (at least 3 characters)")
+        
