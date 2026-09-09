@@ -11,10 +11,13 @@ Creates a clean dataset containing:
 This dataset is used by the Avionics Configuration Manager application
 to display LRU stock information in Tab 2 and Tab 3.
 
+NOTE: LRUs will appear if they are in avionics_parts, even if they have no stock.
+      They will simply show "No stock" indicators.
+
 Inputs:
   - slot_options (to get unique list of LRU PNs)
-  - avionics_parts (to get LRU names/designations)
-  - stock_daily (to get real stock data)
+  - avionics_parts (to get LRU names/designations) - REQUIRED
+  - stock_daily (to get real stock data) - OPTIONAL
 
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/lru_stock_with_names
 """
@@ -24,18 +27,10 @@ from transforms.api import Input, Output, transform, LightweightInput, Lightweig
 
 
 @transform.using(
-    output=Output(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/lru_stock_with_names"
-    ),
-    slot_options=Input(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"
-    ),
-    avionics_parts=Input(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"
-    ),
-    stock_daily=Input(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily"
-    ),
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/lru_stock_with_names"),
+    slot_options=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"),
+    avionics_parts=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/avionics_parts"),
+    stock_daily=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/sources/stock_daily"),
 )
 def compute(
     slot_options: LightweightInput,
@@ -48,8 +43,8 @@ def compute(
 
     Process:
     1. Extract unique LRU PNs from slot_options
-    2. Join with avionics_parts to get Unit (LRU name) and Designation
-    3. Join with stock_daily to get real stock data
+    2. Join with avionics_parts to get Unit (LRU name) and Designation (INNER JOIN - required)
+    3. Join with stock_daily to get real stock data (LEFT JOIN - optional)
     4. Add computed flags and labels
     """
 
@@ -65,9 +60,9 @@ def compute(
     )
 
     # STEP 2: Join with avionics_parts to get LRU names and designations
+    # INNER JOIN: Only keep LRUs that exist in avionics_parts
     df_parts = avionics_parts.polars(lazy=True)
 
-    # Join on part_number = lru_pn
     df_lru_info = lru_pns.join(
         df_parts.select(
             [
@@ -82,10 +77,11 @@ def compute(
         ),
         left_on="lru_pn",
         right_on="part_number",
-        how="left",
+        how="inner",  # Changed from "left" to "inner" - LRU must be in avionics_parts
     )
 
     # STEP 3: Join with stock_daily to get real stock data
+    # LEFT JOIN: Stock data is optional - LRUs will appear even without stock
     df_stock = stock_daily.polars(lazy=True)
 
     df_lru_stock = df_lru_info.join(
@@ -105,13 +101,13 @@ def compute(
         ),
         left_on="lru_pn",
         right_on="part_number",
-        how="left",
+        how="left",  # LEFT JOIN: Stock data is optional
     )
 
     # STEP 4: Clean and enrich data
     df_lru_stock = df_lru_stock.with_columns(
         [
-            # Fill nulls for LRUs not in stock dataset
+            # Fill nulls for LRUs not in stock dataset (will appear as "No stock")
             pl.col("stock_neuf").fill_null(0),
             pl.col("stock_occa").fill_null(0),
             pl.col("stock_total").fill_null(0),
@@ -120,7 +116,7 @@ def compute(
             pl.col("has_stock").fill_null(False),
             pl.col("stock_label").fill_null("❌ No stock data"),
             pl.col("stock_category").fill_null("NO_STOCK"),
-            # Fill nulls for LRUs not in avionics_parts
+            # Avionics_parts fields should never be null (INNER JOIN), but handle just in case
             pl.col("unit").fill_null("Unknown LRU"),
             pl.col("designation").fill_null("No designation available"),
             pl.col("pn_in_production").fill_null("No"),
@@ -179,9 +175,7 @@ def compute(
             .otherwise(pl.lit("❌"))
             .alias("stock_status_icon"),
             # Is LRU available? (has stock + in service)
-            ((pl.col("stock_total") > 0) & (pl.col("in_service") == "Yes")).alias(
-                "is_lru_available"
-            ),
+            ((pl.col("stock_total") > 0) & (pl.col("in_service") == "Yes")).alias("is_lru_available"),
         ]
     )
 
