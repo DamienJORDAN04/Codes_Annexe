@@ -3,20 +3,214 @@ Intermediate: Interchangeability Expanded
 
 Expands abstract designations to physical slots DYNAMICALLY.
 
-v15.2.8 MAJOR REFACTOR - NO HARDCODING:
+v15.3.0 MAJOR REFACTOR - FULLY GENERIC, ZERO HARDCODING:
 - Reads parsed_amendment_rules to detect which slots are part of groups
-- Automatically expands abstract names to physical slots based on group detection
-- If a slot is part of a group (slot_type="group") → Expands to _COM/_MON variants
-- If a slot is standalone (slot_type="mandatory") → Keeps as-is, will be normalized later
+- Normalizes source Designation with a single generic rule:
+    "CARTE BMC"    → "BMC"
+    "CARTE BLC"    → "BLC"
+    "CARTE CPU1"   → "CPU1"
+    "MODULE PSM"   → "PSM"
+    "JEU D'OBRM"  → "OBRM"
+    "ENSEMBLE CABLE" → "CABLE"
+    "BMC"          → "BMC"  (already bare)
+- Matches the normalized designation against slot_name base extracted from
+  parsed_amendment_rules (stripping _COM / _MON / _CARD / _SET suffixes).
+- If a match is found in a group → expands to _COM/_MON physical slots.
+- If no match → keeps the normalized name as-is (standalone slot).
 
-This allows adding new LRU references without code changes.
+v16.3: PREFIX-BASED GROUP MATCHING (uses slots_included from Logic_JSON)
+- NEW: Uses slots_included from slot_groups in Logic_JSON as source of truth
+- Finds longest common prefix among group members (e.g., PSC1/PSC2 → "PSC")
+- Matches interchangeability designations against this prefix
+- Examples:
+    * "CARTE PSC" → "PSC" → finds PSC_GROUP ["PSC1", "PSC2"] → expands to 2 rows
+    * "ANALOGIQUE" → "ANALOG" → finds ANALOG_GROUP ["ANALOG1_CARD", "ANALOG2_CARD"] → expands to 2 rows
+    * "CPU" → "CPU" → finds CPU_GROUP ["CPU_COM", "CPU_MON"] → expands to 2 rows
+- Works for ANY slot naming pattern (CPU1/CPU2, PSC1/PSC2, IO1/IO2, etc.)
 
+v16.3.1: IMPROVED PREFIX MATCHING
+- Exact match first: "ANALOG" matches ("35-0A5", "ANALOG")
+- Prefix match second: "ANALOGIQUE" matches if starts with "ANALOG"
+- Reverse prefix match: "ANALOG" matches if any prefix starts with it
+- Special designations mapping (ANALOGIQUE → ANALOG, etc.)
+
+v16.3.3: HANDLE MIXED SUFFIX PATTERNS
+- PSC slots: "PSC1", "PSC2" (no suffix, "C" already means Card)
+- ANALOG slots: "ANALOG1_CARD", "ANALOG2_CARD" (with _CARD suffix)
+- CPU slots: "CPU_COM", "CPU_MON" (with _COM/_MON suffix)
+- Base name extraction now handles both patterns correctly
+
+v16.3.5: HANDLE GENERIC DESIGNATIONS IN DATA_INTERCHANGEABILITY
+- DATA_INTERCHANGEABILITY uses generic names: "ANALOG_CARD", "OBRM_SET"
+- RULES_AMENDMENTS uses specific names: "ANALOG1_CARD", "ANALOG2_CARD", "OBRM_SET_COM", "OBRM_SET_MON"
+- Strip trailing _CARD from designations to match group prefixes: "ANALOG_CARD" → "ANALOG"
+- Keep _SET in middle of names: "OBRM_SET" → "OBRM_SET"
+
+Adding a new LRU/SRU only requires updating the source datasets.
+No code change needed.
 Input: interchangeability, parsed_amendment_rules
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/interchangeability_expanded
 """
 
+import re
+
 import polars as pl
-from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+from transforms.api import Input, LightweightInput, LightweightOutput, Output, transform
+
+
+# ---------------------------------------------------------------------------
+# Generic prefix normalizer
+# ---------------------------------------------------------------------------
+_PREFIX_PATTERNS = re.compile(
+    r"^(?:CARTE|MODULE|JEU\s+D['\s]?|ENSEMBLE)\s*",
+    re.IGNORECASE,
+)
+
+_PHYSICAL_SUFFIXES = re.compile(r"_(?:COM|MON|CARD|SET)$", re.IGNORECASE)
+
+# Special designation mappings (French variations → canonical prefix)
+_SPECIAL_DESIGNATIONS = {
+    "ANALOGIQUE": "ANALOG",
+    "NUMERIQUE": "NUMERIC",
+    "DIGITAL": "NUMERIC",
+    "CABLAGE": "WIRED_ASSY",
+    "CÂBLAGE": "WIRED_ASSY",
+}
+
+
+def _strip_prefix(designation: str) -> str:
+    """
+    Remove any known French prefix and return the bare slot keyword.
+
+    v16.3.5: Also strips trailing _CARD suffix from generic designations
+    to match group prefixes (ANALOG_CARD → ANALOG).
+
+    Examples:
+        "CARTE BMC"       → "BMC"
+        "CARTE BLC"       → "BLC"
+        "CARTE CPU1"      → "CPU1"
+        "CARTE PSC"       → "PSC"
+        "MODULE PSM"      → "PSM"
+        "JEU D'OBRM"     → "OBRM"  (legacy, not used anymore)
+        "OBRM_SET"        → "OBRM_SET"  (keep _SET in middle)
+        "ANALOG_CARD"     → "ANALOG"  (strip trailing _CARD)
+        "ENSEMBLE CABLE"  → "WIRED_ASSY"
+        "ENSEMBLE CÂBLÉ"  → "WIRED_ASSY"
+        "CABLE"           → "WIRED_ASSY"
+        "ANALOGIQUE"      → "ANALOG"  (special mapping)
+        "BMC"             → "BMC"
+        "PSM_COM"         → "PSM_COM"   (already physical, kept as-is)
+    """
+    if not designation:
+        return designation
+    stripped = _PREFIX_PATTERNS.sub("", designation.strip())
+    # Collapse any remaining internal whitespace
+    normalized = re.sub(r"\s+", "_", stripped.strip()).upper()
+
+    # Special case: normalize all cable-related terms to WIRED_ASSY
+    # This ensures compatibility with Logic_JSON which uses WIRED_ASSY as canonical name
+    if normalized in ("CABLE", "CÂBLÉ", "CABLÉ", "CABLE_CARD", "CABLING"):
+        return "WIRED_ASSY"
+
+    # Special designation mappings (e.g., ANALOGIQUE → ANALOG)
+    if normalized in _SPECIAL_DESIGNATIONS:
+        return _SPECIAL_DESIGNATIONS[normalized]
+
+    # v16.3.5: Strip trailing _CARD from generic designations
+    # "ANALOG_CARD" → "ANALOG" (to match ANALOG_GROUP prefix)
+    # But keep "OBRM_SET" as-is (don't strip _SET when not at the end)
+    if normalized.endswith("_CARD"):
+        normalized = normalized[:-5]  # Remove "_CARD"
+
+    return normalized
+
+
+def _base_name(slot_name: str) -> str:
+    """
+    Remove physical suffixes to get the base keyword.
+
+    v16.3.3: Handles both patterns:
+    - With suffix: "ANALOG1_CARD" → "ANALOG1", "CPU_COM" → "CPU"
+    - Without suffix: "PSC1" → "PSC1", "PSC2" → "PSC2"
+
+    Examples:
+        "PSM_COM"       → "PSM"
+        "CPU_MON"       → "CPU"
+        "ANALOG1_CARD"  → "ANALOG1"
+        "OBRM_SET_COM"  → "OBRM_SET"
+        "OBRM_SET_MON"  → "OBRM_SET"
+        "PSC1"          → "PSC1"  (no suffix, kept as-is)
+        "PSC2"          → "PSC2"  (no suffix, kept as-is)
+        "BLC"           → "BLC"
+        "BMC"           → "BMC"
+    """
+    base = _PHYSICAL_SUFFIXES.sub("", slot_name).upper()
+    return base
+
+
+def _find_common_prefix(slot_names: list[str]) -> str:
+    """
+    v16.3.5: Find the longest common prefix among slot base names.
+
+    Handles mixed patterns:
+    - ["PSC1", "PSC2"] → "PSC" (no suffix)
+    - ["ANALOG1_CARD", "ANALOG2_CARD"] → "ANALOG" (with suffix, strip digits)
+    - ["CPU_COM", "CPU_MON"] → "CPU" (same base)
+    - ["OBRM_SET_COM", "OBRM_SET_MON"] → "OBRM_SET" (keep _SET in middle)
+
+    This is used to match interchangeability designations against slot groups.
+    The prefix is extracted from the base names (without _COM/_MON/_CARD/_SET suffixes).
+
+    Examples:
+        ["PSC1", "PSC2"] → "PSC"
+        ["ANALOG1_CARD", "ANALOG2_CARD"] → "ANALOG"
+        ["CPU_COM", "CPU_MON"] → "CPU"
+        ["OBRM_SET_COM", "OBRM_SET_MON"] → "OBRM_SET"
+        ["IO1_COM", "IO2_COM", "IO1_MON", "IO2_MON"] → "IO"
+
+    Algorithm:
+    1. Extract base names (ANALOG1_CARD → ANALOG1, OBRM_SET_COM → OBRM_SET)
+    2. Find longest common prefix among all bases
+    3. If all bases are identical (e.g., CPU, CPU, OBRM_SET, OBRM_SET), return that base
+    4. Strip trailing digits to get common prefix (ANALOG1, ANALOG2 → ANALOG)
+    5. But preserve compound names with _SET, _MODULE, etc. in the middle
+
+    Args:
+        slot_names: List of physical slot names from slots_included
+
+    Returns:
+        Common prefix string (e.g., "PSC", "CPU", "ANALOG", "OBRM_SET")
+    """
+    if not slot_names:
+        return ""
+
+    # Get base names (without _COM/_MON/_CARD/_SET suffixes at the end)
+    bases = [_base_name(s) for s in slot_names]
+
+    if len(bases) == 1:
+        # Single slot: strip trailing digits only
+        base = bases[0]
+        # Remove trailing digits: "PSC1" → "PSC", "ANALOG1" → "ANALOG"
+        # But keep "OBRM_SET" as-is (no trailing digits)
+        return re.sub(r"\d+$", "", base)
+
+    # Check if all bases are identical (e.g., ["CPU", "CPU"] or ["OBRM_SET", "OBRM_SET"])
+    if len(set(bases)) == 1:
+        # All identical, return the base as-is (no digits to strip)
+        return bases[0]
+
+    # Multiple different bases: find longest common prefix
+    prefix = bases[0]
+    for base in bases[1:]:
+        while prefix and not base.startswith(prefix):
+            prefix = prefix[:-1]
+
+    # Strip trailing digits from prefix if present
+    # "ANALOG1", "ANALOG2" → common prefix "ANALOG" (after removing "1", "2")
+    # "OBRM_SET", "OBRM_SET" → common prefix "OBRM_SET" (no digits to remove)
+    prefix = re.sub(r"\d+$", "", prefix)
+
+    return prefix if prefix else ""
 
 
 @transform.using(
@@ -26,66 +220,146 @@ from transforms.api import Input, Output, transform, LightweightInput, Lightweig
 )
 def compute(interchangeability: LightweightInput, parsed_rules: LightweightInput, output: LightweightOutput) -> None:
     """
-    v15.2.8: Dynamically expands abstract card designations to physical slot names.
+    v16.3.5: Generic expansion with support for generic designations in DATA_INTERCHANGEABILITY.
 
-    NO HARDCODING - Detection is based on parsed_amendment_rules data:
-    - If slot appears in parsed_rules with slot_type="group" → It's a group slot (expand to _COM/_MON)
-    - Otherwise → It's a standalone slot (keep as-is, normalize later)
+    Algorithm
+    ---------
+    1. From parsed_amendment_rules, build group_membership_map:
+         - For each slot_group, find the common prefix among slots_included
+         - Map: (lru_family, prefix) → [physical_slot_1, physical_slot_2, ...]
 
-    Examples:
-    - LA2K2B + "PSC" → Detects PSM_COM/PSM_MON in rules → Expands to both
-    - 350E05 + "PSC" → Detects PSM_CARD in rules (no group) → Keeps as "PSC" (normalized later)
+         Example for PSC_GROUP with slots_included=["PSC1", "PSC2"]:
+           - Base names: ["PSC1", "PSC2"] (no suffix to remove)
+           - Common prefix: "PSC" (strip trailing digits)
+           - Mapping: ("35-0A5", "PSC") → ["PSC1", "PSC2"]
+
+         Example for ANALOG_GROUP with slots_included=["ANALOG1_CARD", "ANALOG2_CARD"]:
+           - Base names: ["ANALOG1", "ANALOG2"] (after removing _CARD suffix)
+           - Common prefix: "ANALOG" (strip trailing digits)
+           - Mapping: ("35-0A5", "ANALOG") → ["ANALOG1_CARD", "ANALOG2_CARD"]
+
+         Example for OBRM_SET_GROUP with slots_included=["OBRM_SET_COM", "OBRM_SET_MON"]:
+           - Base names: ["OBRM_SET", "OBRM_SET"] (after removing _COM/_MON suffixes)
+           - Common prefix: "OBRM_SET" (no trailing digits, keep as-is)
+           - Mapping: ("LA2K2B", "OBRM_SET") → ["OBRM_SET_COM", "OBRM_SET_MON"]
+
+    2. For each row in interchangeability:
+         a. Extract lru_family (first 6 chars of applicable_lru_pn).
+         b. Normalize Designation with _strip_prefix() → bare_keyword.
+            - "ANALOGIQUE" → "ANALOG" (via _SPECIAL_DESIGNATIONS mapping)
+            - "ANALOG_CARD" → "ANALOG" (strip trailing _CARD)
+            - "CARTE PSC" → "PSC"
+            - "OBRM_SET" → "OBRM_SET" (keep as-is)
+         c. Try matching in priority order:
+              1. Exact match: (lru_family, "ANALOG") in map → expands to ANALOG1_CARD, ANALOG2_CARD
+              2. Prefix match: bare_keyword starts with any prefix
+              3. Reverse match: any prefix starts with bare_keyword
+              4. No match: use standalone_map or bare_keyword
+
+    This approach is fully data-driven:
+    - Works for PSC1/PSC2 (no suffix)
+    - Works for ANALOG1_CARD/ANALOG2_CARD (with _CARD suffix)
+    - Works for OBRM_SET_COM/OBRM_SET_MON (compound name with _SET)
+    - Works for CPU_COM/CPU_MON (with _COM/_MON suffix)
+    - Works for any future slot naming pattern
+    - No hardcoded slot names
     """
 
     df_interch = interchangeability.polars(lazy=True)
     df_rules = parsed_rules.polars(lazy=True)
 
     # ================================================================
-    # STEP 1: Build dynamic mapping from parsed_amendment_rules
+    # STEP 1: Build group_membership_map from parsed_amendment_rules
+    # Using slots_included (slot_type='group', group_name set)
     # ================================================================
-    # Extract LRU family (first 6 characters for family-level grouping)
     df_rules = df_rules.with_columns([pl.col("target_lru_pn").str.slice(0, 6).alias("lru_family")])
 
-    # Collect all group slots (slot_type = "group")
-    df_group_slots = (
-        df_rules.filter((pl.col("slot_type") == "group") & (pl.col("slot_name").is_not_null()))
+    # Get all slots that are part of groups
+    rules_data = (
+        df_rules.filter(
+            (pl.col("slot_name").is_not_null())
+            & (pl.col("slot_type") == "group")
+            & (pl.col("group_name").is_not_null())
+        )
         .select(["lru_family", "slot_name", "group_name"])
         .unique()
+        .collect()
     )
 
-    # Collect to build the mapping dictionary
-    group_slots_data = df_group_slots.collect()
+    # Build group_membership_map: {(lru_family, prefix): [physical_slot_names...]}
+    group_membership_map: dict[tuple, list] = {}
 
-    # Build mapping: {(lru_family, base_slot_name): [physical_slot_1, physical_slot_2, ...]}
-    # Example: {("LA2K2B", "PSM"): ["PSM_COM", "PSM_MON"]}
-    group_mapping = {}
-
-    for row in group_slots_data.iter_rows(named=True):
+    # Group by (lru_family, group_name) to collect all slots in each group
+    groups_dict = {}
+    for row in rules_data.iter_rows(named=True):
         lru_family = row["lru_family"]
+        group_name = row["group_name"]
         slot_name = row["slot_name"]
 
-        # Extract base name (remove _COM, _MON, _CARD suffixes)
-        base_name = slot_name
-        for suffix in ["_COM", "_MON", "_CARD"]:
-            if base_name.endswith(suffix):
-                base_name = base_name[: -len(suffix)]
-                break
+        key = (lru_family, group_name)
+        if key not in groups_dict:
+            groups_dict[key] = []
+        groups_dict[key].append(slot_name)
 
-        key = (lru_family, base_name)
+    # For each group, find common prefix and create mapping
+    # CRITICAL FIX: Only include slots that actually belong to the prefix
+    for (lru_family, group_name), slot_names in groups_dict.items():
+        prefix = _find_common_prefix(slot_names)
 
-        if key not in group_mapping:
-            group_mapping[key] = set()
+        if prefix:
+            # Filter slots to only include those that match the prefix
+            # Example: For INPUT1_GROUP with prefix "INPUT1", only keep INPUT11, INPUT12
+            # Exclude INPUT2 slots that don't match "INPUT1" prefix
+            matching_slots = []
+            for slot in slot_names:
+                slot_base = _base_name(slot)
+                # Check if the slot base starts with the prefix or matches the prefix pattern
+                if slot_base.startswith(prefix):
+                    # Additional check: ensure it's truly part of this prefix group
+                    # INPUT11, INPUT12 should match INPUT1 prefix
+                    # INPUT2 should NOT match INPUT1 prefix
+                    if prefix.endswith(("1", "2", "3", "4", "5", "6", "7", "8", "9")):
+                        # If prefix ends with a digit (like INPUT1), slot must start with exact prefix
+                        if slot_base.startswith(prefix) and (
+                            len(slot_base) == len(prefix)
+                            or (len(slot_base) > len(prefix) and slot_base[len(prefix)].isdigit())
+                        ):
+                            matching_slots.append(slot)
+                    else:
+                        # For non-digit ending prefixes, use normal startswith
+                        matching_slots.append(slot)
 
-        group_mapping[key].add(slot_name)
+            if matching_slots:
+                map_key = (lru_family, prefix)
+                group_membership_map[map_key] = sorted(matching_slots)
 
-    # Convert sets to sorted lists for consistency
-    group_mapping = {k: sorted(list(v)) for k, v in group_mapping.items()}
+    # Also build standalone_map for non-group slots (mandatory slots)
+    standalone_rules = (
+        df_rules.filter((pl.col("slot_name").is_not_null()) & (pl.col("slot_type") == "mandatory"))
+        .select(["lru_family", "slot_name"])
+        .unique()
+        .collect()
+    )
+
+    standalone_map: dict[tuple, str] = {}
+    for row in standalone_rules.iter_rows(named=True):
+        lru_family = row["lru_family"]
+        slot_name = row["slot_name"]
+        base = _base_name(slot_name)
+        key = (lru_family, base)
+
+        # First occurrence wins
+        if key not in standalone_map:
+            standalone_map[key] = slot_name
 
     print("=" * 80)
-    print("🔍 DYNAMIC GROUP DETECTION:")
-    print(f"Detected {len(group_mapping)} group configurations")
-    for (family, base), slots in sorted(group_mapping.items()):
-        print(f"  {family} :: {base} → {slots}")
+    print("🔍 v16.3.5: PREFIX-BASED GROUP DETECTION (generic designation support):")
+    print(f"  {len(group_membership_map)} group configurations detected")
+    for (family, prefix), slots in sorted(group_membership_map.items()):
+        print(f"  {family} :: {prefix} → {slots}")
+    print(f"  {len(standalone_map)} standalone slot configurations detected")
+    for (family, base), canonical in sorted(standalone_map.items()):
+        print(f"  {family} :: {base} → {canonical}  (standalone)")
     print("=" * 80)
 
     # ================================================================
@@ -94,102 +368,142 @@ def compute(interchangeability: LightweightInput, parsed_rules: LightweightInput
     df_interch = df_interch.with_columns([pl.col("applicable_lru_pn").str.slice(0, 6).alias("lru_family")])
 
     # ================================================================
-    # STEP 3: For each row, determine if it needs expansion
+    # STEP 3: Match designations against group prefixes (IMPROVED)
     # ================================================================
-    # We need to check if (lru_family, designation_normalized) exists in group_mapping
-
-    # First, normalize the designation to extract base name
-    # Examples:
-    #   - "PSC" → "PSM" (common abbreviation)
-    #   - "MODULE PSM" → "PSM"
-    #   - "JEU D'OBRM" → "OBRM_SET"
-    #   - "CARTE CPU 486" → "CPU"
-    #   - "CARTE IO" → "IO"
-
-    # Strategy: Extract keywords from designation and match with known base names
-    def normalize_designation(designation):
-        """Extract base slot name from abstract designation."""
-        if not designation:
-            return designation
-
-        designation_upper = designation.upper().strip()
-
-        # Common patterns to extract base name
-        if "PSM" in designation_upper or "PSC" in designation_upper:
-            return "PSM"
-        elif "OBRM" in designation_upper:
-            return "OBRM_SET"
-        elif "CPU" in designation_upper:
-            return "CPU"
-        elif "IO" in designation_upper:
-            # Check if it's numbered (IO1, IO2) or generic (IO)
-            if any(num in designation_upper for num in ["IO1", "IO2", "IO3", "IO4"]):
-                # Extract the numbered part (IO1, IO2, etc.)
-                for num in ["IO1", "IO2", "IO3", "IO4"]:
-                    if num in designation_upper:
-                        return num
-            return "IO"
-        elif "ARINC" in designation_upper:
-            return "ARINC64"
-        elif "BLC" in designation_upper:
-            return "BLC"
-        elif "BMC" in designation_upper:
-            return "BMC"
-        elif "WIRED" in designation_upper or "CABLE" in designation_upper or "ENSEMBLE" in designation_upper:
-            return "WIRED_ASSY"
-        else:
-            # Default: keep as-is
-            return designation_upper
-
-    # Apply normalization using Polars map_elements
-    df_interch = df_interch.with_columns(
-        [
-            pl.col("designation")
-            .map_elements(normalize_designation, return_dtype=pl.Utf8)
-            .alias("designation_normalized")
-        ]
-    )
-
-    # ================================================================
-    # STEP 4: Expand rows based on group detection
-    # ================================================================
-    expanded_dfs = []
-
-    # Collect interchangeability data to iterate
     interch_data = df_interch.collect()
+
+    expanded_rows: list[dict] = []
+
+    # Statistics for debugging
+    match_stats = {"exact": 0, "forward_prefix": 0, "reverse_prefix": 0, "standalone": 0, "no_match": 0}
 
     for row in interch_data.iter_rows(named=True):
         lru_family = row["lru_family"]
-        designation_norm = row["designation_normalized"]
+        raw_designation = row.get("designation", "") or ""
 
-        # Check if this should be expanded
-        key = (lru_family, designation_norm)
+        # Generic normalization with special mappings
+        # "ANALOGIQUE" → "ANALOG", "ANALOG_CARD" → "ANALOG", "CARTE PSC" → "PSC", "OBRM_SET" → "OBRM_SET"
+        bare_keyword = _strip_prefix(raw_designation)
 
-        if key in group_mapping:
-            # EXPAND: Create one row for each physical slot in the group
-            physical_slots = group_mapping[key]
+        # Try exact match first
+        exact_key = (lru_family, bare_keyword)
 
-            for physical_slot in physical_slots:
-                expanded_row = {**row}
-                expanded_row["physical_slot_name"] = physical_slot
-                expanded_row["original_designation"] = row["designation"]
-                expanded_row["is_expanded_slot"] = True
-                expanded_dfs.append(expanded_row)
+        if exact_key in group_membership_map:
+            # EXACT MATCH:
+            # "PSC" matches ("35-0A5", "PSC") → ["PSC1", "PSC2"]
+            # "ANALOG" matches ("35-0A5", "ANALOG") → ["ANALOG1_CARD", "ANALOG2_CARD"]
+            # "OBRM_SET" matches ("LA2K2B", "OBRM_SET") → ["OBRM_SET_COM", "OBRM_SET_MON"]
+            for physical_slot in group_membership_map[exact_key]:
+                expanded_rows.append(
+                    {
+                        **row,
+                        "physical_slot_name": physical_slot,
+                        "original_designation": raw_designation,
+                        "is_expanded_slot": True,
+                    }
+                )
+            match_stats["exact"] += 1
+            continue
+
+        # Try forward prefix match: bare_keyword starts with a known prefix
+        # CRITICAL FIX: More precise matching to avoid INPUT2 matching INPUT1 prefix
+        matched = False
+        for (fam, prefix), slots in group_membership_map.items():
+            if fam == lru_family and bare_keyword.startswith(prefix):
+                # Additional validation: ensure this is a true match, not a false positive
+                # INPUT2 should NOT match INPUT1 prefix, even though "INPUT2" starts with "INPUT1"
+                if prefix.endswith(('1', '2', '3', '4', '5', '6', '7', '8', '9')):
+                    # If prefix ends with a digit (like INPUT1), be more strict
+                    # bare_keyword must either be exactly the prefix, or prefix + more digits
+                    if bare_keyword == prefix or (
+                        bare_keyword.startswith(prefix) and 
+                        len(bare_keyword) > len(prefix) and 
+                        bare_keyword[len(prefix)].isdigit()
+                    ):
+                        # True match: INPUT1 matches INPUT1, INPUT11 matches INPUT1
+                        pass  # Continue with expansion
+                    else:
+                        # False match: INPUT2 should not match INPUT1 prefix
+                        continue
+                
+                # FORWARD PREFIX MATCH
+                for physical_slot in slots:
+                    expanded_rows.append(
+                        {
+                            **row,
+                            "physical_slot_name": physical_slot,
+                            "original_designation": raw_designation,
+                            "is_expanded_slot": True,
+                        }
+                    )
+                matched = True
+                match_stats["forward_prefix"] += 1
+                break
+
+        if matched:
+            continue
+
+        # Try reverse prefix match: a known prefix starts with bare_keyword
+        # CRITICAL FIX: More precise reverse matching
+        for (fam, prefix), slots in group_membership_map.items():
+            if fam == lru_family and prefix.startswith(bare_keyword):
+                # Additional validation for reverse matches too
+                # Make sure this is a legitimate reverse match
+                if bare_keyword.endswith(('1', '2', '3', '4', '5', '6', '7', '8', '9')) and prefix.endswith(('1', '2', '3', '4', '5', '6', '7', '8', '9')):
+                    # Both end with digits, ensure they're related
+                    # INPUT2 should not reverse-match INPUT1 prefix
+                    bare_digit = bare_keyword[-1]
+                    prefix_digit = prefix[-1]
+                    if bare_digit != prefix_digit:
+                        continue  # Skip this reverse match
+                
+                # REVERSE PREFIX MATCH
+                for physical_slot in slots:
+                    expanded_rows.append(
+                        {
+                            **row,
+                            "physical_slot_name": physical_slot,
+                            "original_designation": raw_designation,
+                            "is_expanded_slot": True,
+                        }
+                    )
+                matched = True
+                match_stats["reverse_prefix"] += 1
+                break
+
+        if matched:
+            continue
+
+        # NO MATCH: Check standalone_map, otherwise use bare_keyword
+        canonical = standalone_map.get(exact_key, bare_keyword)
+        expanded_rows.append(
+            {
+                **row,
+                "physical_slot_name": canonical,
+                "original_designation": raw_designation,
+                "is_expanded_slot": False,
+            }
+        )
+        if exact_key in standalone_map:
+            match_stats["standalone"] += 1
         else:
-            # NO EXPANSION: Keep as-is (will be normalized in app_slot_options)
-            expanded_row = {**row}
-            expanded_row["physical_slot_name"] = row["designation"]
-            expanded_row["original_designation"] = row["designation"]
-            expanded_row["is_expanded_slot"] = False
-            expanded_dfs.append(expanded_row)
+            match_stats["no_match"] += 1
+
+    print("=" * 80)
+    print("📊 v16.3.5: MATCHING STATISTICS:")
+    print(f"  Exact matches: {match_stats['exact']}")
+    print(f"  Forward prefix matches: {match_stats['forward_prefix']}")
+    print(f"  Reverse prefix matches: {match_stats['reverse_prefix']}")
+    print(f"  Standalone matches: {match_stats['standalone']}")
+    print(f"  No matches: {match_stats['no_match']}")
+    print("=" * 80)
 
     # ================================================================
-    # STEP 5: Convert back to Polars DataFrame
+    # STEP 4: Convert back to Polars DataFrame
     # ================================================================
-    if expanded_dfs:
-        df_result = pl.DataFrame(expanded_dfs)
+    if expanded_rows:
+        df_result = pl.DataFrame(expanded_rows)
     else:
-        # Fallback: no data (should not happen)
         df_result = interch_data.with_columns(
             [
                 pl.col("designation").alias("physical_slot_name"),
@@ -199,7 +513,7 @@ def compute(interchangeability: LightweightInput, parsed_rules: LightweightInput
         )
 
     # ================================================================
-    # STEP 6: Add metadata and sort
+    # STEP 5: Add metadata and sort
     # ================================================================
     df_result = df_result.with_columns(
         [
@@ -218,7 +532,6 @@ def compute(interchangeability: LightweightInput, parsed_rules: LightweightInput
         ]
     )
 
-    # Sort for consistency
     df_result = df_result.sort(["applicable_lru_pn", "physical_slot_name", "new_pn"])
 
     output.write_table(df_result)
