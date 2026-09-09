@@ -38,6 +38,23 @@ def compute(source: LightweightInput, avionics_parts: LightweightInput, output: 
     """
     df = source.polars(lazy=True)
 
+    # Select only the columns that exist in the source CSV (explicitly)
+    # This prevents Polars from trying to access non-existent columns during optimization
+    df = df.select(
+        [
+            "Unit",
+            "Old_PN",
+            "New_PN",
+            "Applicable_LRU_PN",
+            "Designation",
+            "Swap_Logic_JSON",
+            "Comment",
+            "Applicable_amendment",
+            "Entire_Comments",
+            "DD_Issue",
+        ]
+    )
+
     # Filter: Only keep valid swap rules
     df = df.filter(pl.col("Old_PN").is_not_null() & pl.col("New_PN").is_not_null())
 
@@ -80,25 +97,22 @@ def compute(source: LightweightInput, avionics_parts: LightweightInput, output: 
     # Left join to preserve all interchangeability records
     df = df.join(df_parts_subset, left_on="New_PN", right_on="part_number", how="left")
 
-    # Rename the joined column
-    df = df.with_columns([pl.col("new_pn_label_temp").alias("New_PN_Label")]).drop("new_pn_label_temp")
-
-    # Rename columns for consistency
-    df = df.rename(
-        {
-            "Verdict_Type": "verdict_type",
-            "Unit": "unit",
-            "Old_PN": "old_pn",
-            "New_PN": "new_pn",
-            "Applicable_LRU_PN": "applicable_lru_pn",
-            "Designation": "designation",
-            "Swap_Logic_JSON": "swap_logic_json",
-            "Comment": "comment",
-            "Applicable_amendment": "amendment_letter",  # Updated from screenshot
-            "Entire_Comments": "entire_description",  # Updated from screenshot
-            "All_Supersedes": "all_supersedes",
-            "New_PN_Label": "new_pn_label",
-        }
+    # Select and rename all columns explicitly to avoid Polars optimization issues
+    df = df.select(
+        [
+            pl.col("Unit").alias("unit"),
+            pl.col("Old_PN").alias("old_pn"),
+            pl.col("New_PN").alias("new_pn"),
+            pl.col("Applicable_LRU_PN").alias("applicable_lru_pn"),
+            pl.col("Designation").alias("designation"),
+            pl.col("Swap_Logic_JSON").alias("swap_logic_json"),
+            pl.col("Comment").alias("comment"),
+            pl.col("Applicable_amendment").alias("amendment_letter"),
+            pl.col("Entire_Comments").alias("entire_description"),
+            pl.col("DD_Issue").alias("dd_issue"),
+            pl.col("Verdict_Type").alias("verdict_type"),
+            pl.col("new_pn_label_temp").alias("new_pn_label"),
+        ]
     )
 
     # 🧹 CLEAN: Strip whitespace from text columns (especially designation)
@@ -108,6 +122,11 @@ def compute(source: LightweightInput, avionics_parts: LightweightInput, output: 
             pl.col("old_pn").str.strip_chars().alias("old_pn"),
             pl.col("new_pn").str.strip_chars().alias("new_pn"),
             pl.col("applicable_lru_pn").str.strip_chars().alias("applicable_lru_pn"),
+            # Clean dd_issue if it exists
+            pl.when(pl.col("dd_issue").is_not_null())
+            .then(pl.col("dd_issue").str.strip_chars())
+            .otherwise(pl.col("dd_issue"))
+            .alias("dd_issue"),
         ]
     )
 
@@ -127,7 +146,13 @@ def compute(source: LightweightInput, avionics_parts: LightweightInput, output: 
     df = df.with_columns(
         [
             # Flag: Is this a "standard" swap (no amendment impact)?
-            pl.col("swap_logic_json").str.contains('"req": "STD"').fill_null(False).alias("is_standard_swap"),
+            # FIXED: Accept both formats: "req": "STD" and "req":"STD"
+            (
+                pl.col("swap_logic_json").str.contains('"req"\\s*:\\s*"STD"')
+                | pl.col("swap_logic_json").str.contains("STD")
+            )
+            .fill_null(False)
+            .alias("is_standard_swap"),
             # Flag: Does this swap force a single amendment?
             pl.col("swap_logic_json").str.contains('"amdt"').fill_null(False).alias("forces_single_amendment"),
             # Flag: Does this swap force multiple amendment options (OR logic)?
