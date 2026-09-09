@@ -10,6 +10,8 @@ OPTIMIZED FOR SCALE:
 - Memory efficient (works with 10x more data)
 - Supports mix_policy (ANY = can mix PNs in groups like CPU_COM/CPU_MON)
 
+v16.0: Removed 'supersedes' column — no longer present in source data.
+
 Input: swap_validation
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_swap_validation
 """
@@ -30,14 +32,14 @@ def compute(validation: LightweightInput, output: LightweightOutput) -> None:
     1. GO/NO-GO decision
     2. Amendment requirement
     3. Stock availability
-    4. Group constraints (NEW for LA2K2 family)
+    4. Group constraints (for LA2K2 family)
 
     Query pattern: WHERE validation_key = 'LRU::OLD::NEW'
     """
 
     df = validation.polars(lazy=True)
 
-    # Select essential columns (added group-related columns)
+    # Select essential columns (supersedes removed)
     df_minimal = df.select(
         [
             # Keys (for queries)
@@ -56,7 +58,7 @@ def compute(validation: LightweightInput, output: LightweightOutput) -> None:
             "validation_message",
             # Amendment info (what to do)
             "amendment_letter",
-            "supersedes",  # NEW: Amendements remplacés
+            "dd_issue",  # UPDATED: replaced supersedes with dd_issue
             "requires_amendment_choice",
             "amendment_options_json",
             # Stock (availability)
@@ -64,13 +66,13 @@ def compute(validation: LightweightInput, output: LightweightOutput) -> None:
             "stock_occa",
             "stock_total",
             "part_stock_display",
-            # Part metadata (NEW: production status)
-            "pn_in_production",  # ✅ ADD: Production status
+            # Part metadata
+            "pn_in_production",
             "in_service",
             "procurable",
             "repairable",
             "is_available",
-            # Group info (NEW - for LA2K2 mix_policy)
+            # Group info
             "is_part_of_group",
             "group_name",
             "mix_policy",
@@ -99,7 +101,7 @@ def compute(validation: LightweightInput, output: LightweightOutput) -> None:
             .then(pl.lit("🟠"))
             .otherwise(pl.lit("🔴"))
             .alias("stock_icon"),
-            # Group icon (NEW)
+            # Group icon
             pl.when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "ANY"))
             .then(pl.lit("🔄 MIX ALLOWED"))
             .when(pl.col("is_part_of_group") & (pl.col("mix_policy") == "SAME"))
@@ -111,13 +113,10 @@ def compute(validation: LightweightInput, output: LightweightOutput) -> None:
         ]
     )
 
-    # Remove duplicates (can happen due to multiple rules/joins upstream)
-    # IMPORTANT: Keep physical_slot_name in the key to preserve all slots
-    # (same PN can go in multiple physical slots like IO1_COM and IO2_COM)
+    # Remove duplicates
     df_minimal = df_minimal.unique(subset=["validation_key", "physical_slot_name"], maintain_order=True)
 
     # Sort for optimal query performance
     df_minimal = df_minimal.sort("validation_key")
 
     output.write_table(df_minimal)
-
