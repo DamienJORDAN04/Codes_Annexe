@@ -1,0 +1,324 @@
+"""
+Output Transform: S7 Lookup for LRU Configurator
+
+Creates optimized lookup table for LRU Configurator auto-fill functionality.
+Aggregates S7 data by notification number to provide:
+- LRU PN
+- List of cards/SRU with their slots
+- Amendments configuration (v3.0 - SOURCE OF TRUTH = S7 AMENDMENT_RECEIVED)
+Inputs:
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/s7_lru_configuration
+  - /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options
+
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_s7_lookup
+"""
+
+import polars as pl
+from transforms.api import Input, Output, transform, LightweightInput, LightweightOutput
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_s7_lookup"),
+    s7_config=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/s7_lru_configuration"),
+    slot_options=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"),
+)
+def compute(
+    s7_config: LightweightInput,
+    slot_options: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Create optimized S7 lookup table for LRU Configurator.
+
+    ✅ v3.0 FIX (amendments): The amendments for auto-fill are now taken from the
+    ACTUAL amendment declared on the S7 notification (AMENDMENT_RECEIVED ->
+    amendments_raw), NOT reconstructed from slot_options.amendment_letter.
+
+    Why the old behaviour was wrong:
+      - slot_options.amendment_letter lists ALL amendments a card is COMPATIBLE
+        with (e.g. a card COMPATIBLE_MULTIPLE_AMDT can be "A, B, C").
+      - Merging those across every card produced the UNION of all *possible*
+        amendments, so the configurator pre-checked amendments that were never
+        actually applied on the notification (false configuration).
+
+    New behaviour:
+      1. amendments_from_s7  = parsed AMENDMENT_RECEIVED (source of truth)
+      2. amendments_from_cards = union of card compatibilities (fallback only,
+         and intersected with what the S7 declares when both are present)
+    Aggregation logic:
+    1. Group by notification_number_normalized + lru_pn
+    2. Aggregate all cards found in that notification
+    3. Map cards to their physical slots using slot_options
+    4. Extract the notification's declared amendments (amendments_raw)
+    5. Deduplicate and produce a single accurate amendments list
+    6. Keep slot_card_pairs for auto-fill
+    """
+
+    df_s7 = s7_config.polars(lazy=True)
+    df_slots = slot_options.polars(lazy=True)
+
+    # === STEP 1: Filter complete records ===
+    # Keep only records with both LRU and at least one card
+    df = df_s7.filter(pl.col("has_lru") & pl.col("has_card"))
+
+    # === STEP 2: Join with slot_options to get physical slot names AND amendments ===
+    # amendment_letter here is only used as a FALLBACK (list of compatible amendments)
+    df_slots_map = df_slots.select(
+        [
+            pl.col("applicable_lru_pn"),
+            pl.col("new_pn"),
+            pl.col("physical_slot_name"),
+            pl.col("amendment_letter"),  # compatible amendments for the card (fallback only)
+        ]
+    ).unique()
+
+    # Join to get slot information
+    df = df.join(
+        df_slots_map,
+        left_on=["lru_pn", "card_pn"],
+        right_on=["applicable_lru_pn", "new_pn"],
+        how="left",
+    )
+
+    # === STEP 3: Aggregate cards per notification ===
+    # Collect the data first to work in eager mode
+    df_collected = df.collect()
+
+    # Group by notification + LRU, collect all cards and slots
+    df_aggregated = df_collected.group_by(
+        ["notification_number_normalized", "notification_number_original", "lru_pn"]
+    ).agg(
+        [
+            # LRU info (take first)
+            pl.col("lru_display_name").first(),
+            pl.col("lru_designation").first(),
+            # Cards list
+            pl.col("card_pn").unique().alias("cards_list"),
+            # Collect physical slot names and corresponding card PNs
+            pl.col("physical_slot_name").alias("slot_names_list"),
+            pl.col("card_pn").alias("slot_card_pns_list"),
+            # Card compatibilities (FALLBACK only)
+            pl.col("amendment_letter").alias("card_amendments_list"),
+            # ✅ SOURCE OF TRUTH: the amendment declared on the S7 notification.
+            # amendments_raw comes from AMENDMENT_RECEIVED. Collect ALL values seen
+            # for this notification (not just .first()) so nothing is lost, then
+            # deduplicate in parse_declared_amendments().
+            pl.col("amendments_raw").alias("declared_amendments_list"),
+            pl.col("amendment_received").first(),
+            # Metadata
+            pl.col("creation_date").first(),
+            pl.col("msn").first(),
+            pl.col("immat").first(),
+            pl.col("client_name").first(),
+            pl.col("equipment_number").first(),
+        ]
+    )
+
+    # Filter out nulls and create slot_card_pairs
+    def create_slot_card_pairs(slots, pns):
+        """Create list of {slot, pn} dicts, filtering out nulls"""
+        if slots is None or pns is None:
+            return []
+        result = []
+        for slot, pn in zip(slots, pns):
+            if slot is not None:
+                result.append({"slot": slot, "pn": pn})
+        return result
+
+    df_aggregated = df_aggregated.with_columns(
+        [
+            pl.struct([pl.col("slot_names_list"), pl.col("slot_card_pns_list")])
+            .map_elements(
+                lambda x: create_slot_card_pairs(x["slot_names_list"], x["slot_card_pns_list"]),
+                return_dtype=pl.List(pl.Struct([pl.Field("slot", pl.Utf8), pl.Field("pn", pl.Utf8)])),
+            )
+            .alias("slot_card_pairs")
+        ]
+    ).drop(["slot_names_list", "slot_card_pns_list"])
+
+    # === STEP 4: Parse amendments (v3.0 - S7 declaration is the source of truth) ===
+
+    def _clean_amendment_tokens(raw_str):
+        """
+        Split a raw amendment string into clean amendment tokens.
+
+        ✅ FIX ("EIJKL"): business rule is 1 amendment = 1 LETTER, and S7 can
+        deliver amendments CONCATENATED without any separator (e.g. "EIJKL" ==
+        E, I, J, K, L). We therefore:
+          - accept comma / space / slash / semicolon / pipe separators
+          - AND explode each remaining token letter-by-letter
+        so "EIJKL" -> {"E","I","J","K","L"}.
+        NOTE: this is only valid because every amendment is a single letter.
+        """
+        import re as _re
+
+        tokens = set()
+        if raw_str is None:
+            return tokens
+
+        # First normalize any explicit separators to a single delimiter
+        for part in _re.split(r"[,\s/;|]+", str(raw_str)):
+            clean = part.strip().upper()
+            if not clean or clean in ("STD", "NONE", "NAN"):
+                continue
+            # Explode letter-by-letter (1 amendment = 1 letter)
+            for ch in clean:
+                if ch.isalpha():
+                    tokens.add(ch)
+        return tokens
+
+    def parse_declared_amendments(declared_list):
+        """
+        Parse the amendments ACTUALLY declared on the S7 notification.
+        Input: list of amendments_raw strings (e.g. ["B", "B", None]).
+        Output: sorted unique list (e.g. ["B"]).
+        """
+        if declared_list is None:
+            return []
+        result = set()
+        for raw in declared_list:
+            result |= _clean_amendment_tokens(raw)
+        return sorted(result)
+
+    def parse_card_compatible_amendments(card_amendments):
+        """
+        Parse the amendments cards are COMPATIBLE with (fallback only).
+        Input: list of amendment_letter strings (e.g. ["A", "B,C", None]).
+        Output: sorted unique list (e.g. ["A", "B", "C"]).
+        """
+        if card_amendments is None:
+            return []
+        result = set()
+        for raw in card_amendments:
+            result |= _clean_amendment_tokens(raw)
+        return sorted(result)
+
+    df_aggregated = df_aggregated.with_columns(
+        [
+            # ✅ Source of truth: what the S7 notification actually declares
+            pl.col("declared_amendments_list")
+            .map_elements(parse_declared_amendments, return_dtype=pl.List(pl.Utf8))
+            .alias("amendments_from_s7"),
+            # Fallback: union of card compatibilities
+            pl.col("card_amendments_list")
+            .map_elements(parse_card_compatible_amendments, return_dtype=pl.List(pl.Utf8))
+            .alias("amendments_from_cards"),
+        ]
+    )
+
+    def resolve_amendments(from_s7, from_cards):
+        """
+        Decide the final amendment list for auto-fill.
+
+        Priority:
+          1. If the S7 notification declares amendments -> use EXACTLY those
+             (they are the real applied configuration). If card compatibilities
+             are known, keep only declared amendments that are actually
+             compatible with at least one selected card (defensive filter);
+             if the intersection is empty, still trust the S7 declaration.
+          2. If the S7 declares nothing -> STANDARD configuration => empty list.
+             We intentionally do NOT fall back to the union of card
+             compatibilities, because that produced false amendments.
+        """
+        s7 = list(from_s7) if from_s7 else []
+        cards = set(from_cards) if from_cards else set()
+
+        if s7:
+            if cards:
+                filtered = [a for a in s7 if a in cards]
+                return sorted(filtered) if filtered else sorted(s7)
+            return sorted(s7)
+        # No amendment declared on the S7 => STANDARD
+        return []
+
+    df_aggregated = df_aggregated.with_columns(
+        [
+            pl.struct([pl.col("amendments_from_s7"), pl.col("amendments_from_cards")])
+            .map_elements(
+                lambda x: resolve_amendments(x["amendments_from_s7"], x["amendments_from_cards"]),
+                return_dtype=pl.List(pl.Utf8),
+            )
+            .alias("amendments_list")
+        ]
+    ).drop(
+        [
+            "card_amendments_list",
+            "declared_amendments_list",
+            "amendments_from_s7",
+            "amendments_from_cards",
+        ]
+    )
+
+    # === STEP 5: Create slot configuration JSON ===
+    # Convert slot_card_pairs to a structured format for easy lookup
+    # Format: {"SLOT1": "PN1", "SLOT2": "PN2", ...}
+
+    # Note: In Polars, we'll keep as a list of structs
+    # The application will parse this into a dict
+
+    # === STEP 6: Add configuration metadata ===
+    df_aggregated = df_aggregated.with_columns(
+        [
+            # Number of cards
+            pl.col("cards_list").list.len().alias("num_cards"),
+            # Number of amendments
+            pl.col("amendments_list").list.len().alias("num_amendments"),
+        ]
+    )
+
+    # Add derived columns that depend on num_amendments
+    df_aggregated = df_aggregated.with_columns(
+        [
+            # Has amendments?
+            (pl.col("num_amendments") > 0).alias("has_amendments"),
+            # Configuration quality score (higher = better)
+            # ✨ ENHANCED: Higher weight for amendments (they're now more accurate)
+            (pl.col("num_cards") * 10 + pl.col("num_amendments") * 8).alias("config_quality_score"),
+        ]
+    )
+
+    # === STEP 7: Create lookup keys ===
+    df_aggregated = df_aggregated.with_columns(
+        [
+            # Primary key: notification_normalized
+            pl.col("notification_number_normalized").alias("lookup_key"),
+            # Secondary key: notification_original (for alternate search)
+            pl.col("notification_number_original").alias("lookup_key_alt"),
+            # Composite key: notification::lru_pn
+            (pl.col("notification_number_normalized") + "::" + pl.col("lru_pn")).alias("composite_key"),
+        ]
+    )
+
+    # === STEP 8: Select and order final columns ===
+    df_final = df_aggregated.select(
+        [
+            # Keys
+            "lookup_key",
+            "lookup_key_alt",
+            "composite_key",
+            "notification_number_normalized",
+            "notification_number_original",
+            # LRU Information
+            "lru_pn",
+            "lru_display_name",
+            "lru_designation",
+            # Configuration
+            "cards_list",
+            "slot_card_pairs",
+            "amendments_list",  # ✅ v3.0: Accurately parsed from S7 declaration
+            "amendment_received",
+            # Metrics
+            "num_cards",
+            "num_amendments",
+            "has_amendments",
+            "config_quality_score",
+            # Context
+            "creation_date",
+            "msn",
+            "immat",
+            "client_name",
+            "equipment_number",
+        ]
+    ).sort("config_quality_score", descending=True)
+
+    output.write_table(df_final)
