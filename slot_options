@@ -1,0 +1,425 @@
+"""
+Output Dataset: Slot Configuration Options
+
+Ultra-lightweight dataset for dropdown population in the UI.
+Used for: "What cards can I put in slot PSM_COM of LRU X?"
+
+v15.4.0 — DYNAMIC PARENT SLOT DETECTION:
+- physical_slot_name comes directly from interchangeability_expanded (already canonical).
+  The upstream transform normalizes "CARTE BMC" -> "BMC", "CARTE CPU1" -> "CPU1", etc.
+  No second-pass prefix stripping is needed here.
+- Child/parent hierarchy is detected dynamically from parsed_amendment_rules:
+  * Any slot whose allowed_pns contains the context_pn is treated as a parent slot
+  * All other slots in the same context group are treated as children
+  * No hardcoded parent slot names (WIRED_ASSY, PSM_CARD, etc.) - fully data-driven
+- Adding a new LRU, SRU or slot type requires only dataset updates — no code change.
+
+v15.5.0 — GROUP ENRICHMENT FIX:
+- Propagate group_name, mix_policy, and is_part_of_group from parsed_amendment_rules
+- Join slot_groups_metadata to get complete group information
+- Fixes issue where PSC_GROUP, ANALOG_GROUP were not displayed as groups in UI
+
+v16.3.2 — GROUP VISUAL DISPLAY FIX:
+- For grouped slots (PSC1_CARD, PSC2_CARD in PSC_GROUP), ui_slot_key now uses group_name
+- This ensures PSC_GROUP appears as ONE entry in UI, not separate PSC1_CARD/PSC2_CARD entries
+- Individual slots are still tracked in physical_slot_name for validation
+- Fixes: PSC_GROUP, ANALOG_GROUP now display correctly as unified groups
+
+v16.3.4 — USE SOURCE DATASET NAMES ONLY:
+- ui_slot_key now uses physical_slot_name for ALL slots (grouped and standalone)
+- No more French names (original_designation) in ui_slot_key
+- Uses only normalized names from parsed_amendment_rules: BMC, BLC, PSC1, PSC2, ANALOG1_CARD, etc.
+- For grouped slots: still use group_name (PSC_GROUP, ANALOG_GROUP)
+- For standalone slots: use physical_slot_name (BMC, BLC, WIRED_ASSY)
+
+v16.3.6 — FIX GROUP SLOT DEDUPLICATION:
+- CRITICAL FIX: Deduplicate by physical_slot_name BEFORE creating ui_slot_key
+- Previous bug: ui_slot_key used group_name for ALL slots in a group, causing deduplication
+  to keep only 1 slot instead of all slots in the group (e.g., OBRM_SET_GROUP had only
+  OBRM_SET_MON, missing OBRM_SET_COM)
+- New logic: Deduplicate by (lru, physical_slot_name, new_pn) first to preserve all
+  physical slots, then create ui_slot_key for display purposes
+- Fixes: LA2K2 OBRM_SET_GROUP now shows both OBRM_SET_COM and OBRM_SET_MON
+- Fixes: MFC ANALOG_GROUP now shows both ANALOG1_CARD and ANALOG2_CARD
+
+Input: swap_validation, parsed_amendment_rules, slot_groups_metadata
+Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options
+"""
+
+import json as json_lib
+
+import polars as pl
+from transforms.api import Input, LightweightInput, LightweightOutput, Output, transform
+
+
+@transform.using(
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/slot_options"),
+    validation=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/swap_validation"),
+    amendment_rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
+    slot_groups=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata"),
+)
+def compute(
+    validation: LightweightInput,
+    amendment_rules: LightweightInput,
+    slot_groups: LightweightInput,
+    output: LightweightOutput,
+) -> None:
+    """
+    Minimal slot options for dropdown menus.
+
+    Pre-filtered : ONLY GO verdicts.
+    Pre-sorted   : STD > NEUF > amendments.
+
+    v16.3.6 changes (CRITICAL FIX)
+    ---------------
+    - Deduplicate by physical_slot_name BEFORE creating ui_slot_key
+    - This preserves all physical slots in a group (e.g., OBRM_SET_COM, OBRM_SET_MON)
+    - ui_slot_key is created AFTER deduplication for display purposes only
+    """
+
+    df = validation.polars(lazy=True)
+    df_rules = amendment_rules.polars(lazy=True)
+    df_groups = slot_groups.polars(lazy=True)
+
+    # ── 1. Filter: GO verdicts only ────────────────────────────────────────────
+    df_minimal = df.filter(pl.col("interchangeability_verdict") == "GO").select(
+        [
+            "applicable_lru_pn",
+            "designation",
+            "physical_slot_name",
+            "original_designation",
+            "is_expanded_slot",
+            "new_pn",
+            "old_pn",
+            "part_display_name",
+            "amendment_letter",
+            "compatibility_level",
+            "requires_amendment_choice",
+            "stock_neuf",
+            "stock_occa",
+            "recommendation_score",
+            "pn_in_production",
+        ]
+    )
+
+    # ── 2. Enrich with group information ───────────────────────────────────────
+    # Join with slot_groups_metadata to get group_name, mix_policy, and other_slots_str
+    # Use left join to keep all slots (grouped and non-grouped)
+    #
+    # ✅ v16.3.2 FIX: Deduplicate by (target_lru_pn, slot_name) before aggregation
+    # slot_groups_metadata contains multiple rows per slot (one per rule_id/amendment)
+    # We need to deduplicate first to get clean group metadata
+    df_groups_dedup = df_groups.unique(subset=["target_lru_pn", "slot_name"], maintain_order=True)
+
+    df_groups_agg = (
+        df_groups_dedup.group_by(["target_lru_pn", "slot_name"])
+        .agg(
+            [
+                pl.col("group_name").first().alias("group_name"),
+                pl.col("mix_policy").first().alias("mix_policy"),
+                pl.col("other_slots_str").first().alias("other_slots_str"),
+                pl.col("mix_policy_description").first().alias("group_constraint_message"),
+            ]
+        )
+        .select(
+            [
+                pl.col("target_lru_pn").alias("applicable_lru_pn"),
+                pl.col("slot_name").alias("physical_slot_name"),
+                "group_name",
+                "mix_policy",
+                "other_slots_str",
+                "group_constraint_message",
+            ]
+        )
+    )
+
+    df_minimal = df_minimal.join(
+        df_groups_agg,
+        on=["applicable_lru_pn", "physical_slot_name"],
+        how="left",
+    )
+
+    # Set is_part_of_group based on whether group_name is present
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("group_name").is_not_null())
+            .then(pl.lit(True))
+            .otherwise(pl.lit(False))
+            .alias("is_part_of_group")
+        ]
+    )
+
+    # ── 3. Dropdown label & badges ─────────────────────────────────────────────
+    # IMPORTANT: mix_policy is NOT included in dropdown_label because it varies by amendment
+    # The UI will use the mix_policy column for dynamic filtering
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.concat_str(
+                [
+                    pl.col("new_pn"),
+                    pl.lit(" - "),
+                    pl.col("part_display_name").fill_null(""),
+                    pl.when(pl.col("stock_neuf") > 0)
+                    .then(pl.concat_str([pl.lit(" (NEUF: "), pl.col("stock_neuf").cast(pl.Utf8), pl.lit(")")]))
+                    .when(pl.col("stock_occa") > 0)
+                    .then(pl.concat_str([pl.lit(" (OCCA: "), pl.col("stock_occa").cast(pl.Utf8), pl.lit(")")]))
+                    .otherwise(pl.lit(" (No stock)")),
+                    pl.when(pl.col("is_part_of_group"))
+                    .then(pl.concat_str([pl.lit(" ["), pl.col("group_name"), pl.lit("]")]))
+                    .otherwise(pl.lit("")),
+                    pl.when(pl.col("pn_in_production") == "Yes")
+                    .then(pl.lit(" [IN PROD]"))
+                    .when(pl.col("pn_in_production") == "No")
+                    .then(pl.lit(" [OUT OF PROD]"))
+                    .otherwise(pl.lit("")),
+                ]
+            ).alias("dropdown_label"),
+            pl.when(pl.col("compatibility_level") == "COMPATIBLE_STD")
+            .then(pl.lit("STD"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_SINGLE_AMDT")
+            .then(pl.col("amendment_letter"))
+            .when(pl.col("compatibility_level") == "COMPATIBLE_MULTIPLE_AMDT")
+            .then(pl.lit("CHOICE"))
+            .otherwise(pl.lit(""))
+            .alias("amendment_badge"),
+            # group_hint is dynamic and will be computed by the UI based on current mix_policy
+            pl.when(pl.col("is_part_of_group"))
+            .then(pl.col("other_slots_str"))
+            .otherwise(pl.lit(""))
+            .alias("group_hint"),
+            pl.when(pl.col("pn_in_production") == "Yes")
+            .then(pl.lit("**IN PRODUCTION**"))
+            .when(pl.col("pn_in_production") == "No")
+            .then(pl.lit("OUT OF PRODUCTION"))
+            .otherwise(pl.lit("UNKNOWN"))
+            .alias("production_status_display"),
+        ]
+    )
+
+    # ── 4. Sort & deduplicate BY PHYSICAL SLOT NAME (v16.3.6 FIX) ─────────────
+    # 🔧 CRITICAL FIX: Deduplicate by physical_slot_name BEFORE creating ui_slot_key
+    # This preserves all physical slots in a group (OBRM_SET_COM, OBRM_SET_MON, etc.)
+    # Previous bug: deduplication happened AFTER ui_slot_key creation, which used
+    # group_name, causing all slots in a group to have the same key and be deduplicated
+    # to just 1 slot instead of keeping all slots.
+    df_minimal = df_minimal.sort(
+        ["applicable_lru_pn", "physical_slot_name", "recommendation_score"],
+        descending=[False, False, True],
+    )
+
+    # ✅ v16.3.6 FIX: Deduplicate by physical_slot_name to preserve all slots
+    df_minimal = df_minimal.unique(subset=["applicable_lru_pn", "physical_slot_name", "new_pn"], maintain_order=True)
+
+    # ── 5. ui_slot_key (MOVED AFTER DEDUPLICATION) ────────────────────────────
+    # ✅ Now created AFTER deduplication to avoid losing slots
+    # ✅ For group slots: use group_name (PSC_GROUP, ANALOG_GROUP)
+    # ✅ For standalone slots: use physical_slot_name (BMC, BLC, WIRED_ASSY)
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("is_part_of_group"))
+            .then(pl.col("group_name"))  # PSC_GROUP, ANALOG_GROUP, etc.
+            .otherwise(pl.col("physical_slot_name"))  # BMC, BLC, WIRED_ASSY, etc.
+            .alias("ui_slot_key")
+        ]
+    )
+
+    # ── 6. Amendment-specific supersedes ──────────────────────────────────────
+    df_amendment_supersedes = df_rules.select(["target_lru_pn", "amdt_name", "supersedes"]).unique(
+        subset=["target_lru_pn", "amdt_name"]
+    )
+
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.col("amendment_letter").str.split(", ").alias("amendment_options_list"),
+        ]
+    )
+
+    def _to_list(v) -> list:
+        """Normalize any supersedes representation to a plain Python list."""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                try:
+                    parsed = json_lib.loads(s)
+                    return parsed if isinstance(parsed, list) else []
+                except Exception:
+                    pass
+            if "," in s:
+                return [x.strip() for x in s.split(",") if x.strip()]
+            return [s]
+        return []
+
+    def build_amendment_supersedes(lru_pn, amendments, rules_dict):
+        if not amendments or len(amendments) <= 1:
+            return None
+        result = {}
+        for amdt in amendments:
+            rule_list = _to_list(rules_dict.get(f"{lru_pn}::{amdt}"))
+            if rule_list:
+                result[amdt] = rule_list
+            else:
+                # If no specific rule, each amendment supersedes all others
+                other = [a for a in amendments if a != amdt]
+                result[amdt] = other
+        return json_lib.dumps(result) if result else None
+
+    df_with_choice = df_minimal.filter(
+        pl.col("requires_amendment_choice") & (pl.col("amendment_options_list").list.len() > 1)
+    )
+    df_without_choice = df_minimal.filter(
+        ~(pl.col("requires_amendment_choice") & (pl.col("amendment_options_list").list.len() > 1))
+    )
+
+    if len(df_with_choice.collect()) > 0:
+        rules_collected = df_amendment_supersedes.collect()
+        rules_dict = {
+            f"{r['target_lru_pn']}::{r['amdt_name']}": _to_list(r["supersedes"])
+            for r in rules_collected.iter_rows(named=True)
+        }
+        df_with_choice = df_with_choice.with_columns(
+            [
+                pl.struct(["applicable_lru_pn", "amendment_options_list"])
+                .map_elements(
+                    lambda r: build_amendment_supersedes(
+                        r["applicable_lru_pn"],
+                        r["amendment_options_list"],
+                        rules_dict,
+                    ),
+                    return_dtype=pl.Utf8,
+                )
+                .alias("amendment_specific_supersedes")
+            ]
+        )
+    else:
+        df_with_choice = df_with_choice.with_columns([pl.lit(None).alias("amendment_specific_supersedes")])
+
+    df_without_choice = df_without_choice.with_columns([pl.lit(None).alias("amendment_specific_supersedes")])
+    df_minimal = pl.concat([df_with_choice, df_without_choice]).drop(["amendment_options_list"])
+
+    # ── 7. Hierarchy: Dynamic parent/child detection (fully data-driven) ───────
+    #
+    # Parent slot identification:
+    #   - A slot is a parent if its allowed_pns contains the context_pn
+    #
+    # Child slot identification:
+    #   - All other slots in the same (lru_pn, amendment, context_pn) group
+    #
+    # No slot names are hardcoded — works for WIRED_ASSY, PSM_CARD, or any future parent slot.
+
+    df_rules_collected = (
+        df_rules.select(["target_lru_pn", "amdt_name", "slot_name", "slot_type", "context_pn", "allowed_pns"])
+        .filter(pl.col("slot_type") == "mandatory")
+        .collect()
+    )
+
+    hierarchy_map = {}  # (child_pn, lru_pn) -> [parent_pn, ...]
+    parent_slot_map = {}  # (child_pn, lru_pn) -> parent_slot_name
+
+    if len(df_rules_collected) > 0:
+        # Group rows by (lru_pn, amendment, context_pn)
+        grouped = {}
+        for row in df_rules_collected.iter_rows(named=True):
+            allowed = _to_list(row.get("allowed_pns"))
+            ctx_pn = row.get("context_pn")
+
+            # Skip rows without context_pn
+            if not ctx_pn or ctx_pn == "no_context":
+                continue
+
+            grp_key = (row["target_lru_pn"], row["amdt_name"], ctx_pn)
+            grouped.setdefault(grp_key, {})[row["slot_name"]] = allowed
+
+        for (lru_pn, _amdt, ctx_pn), slots_dict in grouped.items():
+            # Identify parent slot: the slot whose allowed_pns contains the context_pn
+            parent_slot_name = None
+            parent_pn = ctx_pn
+
+            for slot_name, allowed_pns in slots_dict.items():
+                if ctx_pn in allowed_pns:
+                    parent_slot_name = slot_name
+                    break
+
+            # If no explicit parent slot found, treat context_pn as implicit parent
+            # (STD pattern: context_pn IS the parent PN, no explicit parent slot row)
+            if not parent_slot_name:
+                # All slots in this group are children of the implicit parent
+                for child_slot, child_pns in slots_dict.items():
+                    for child_pn in child_pns:
+                        k = (child_pn, lru_pn)
+                        if parent_pn not in hierarchy_map.get(k, []):
+                            hierarchy_map.setdefault(k, []).append(parent_pn)
+                        # Use context_pn as the parent slot name for display
+                        parent_slot_map[k] = f"[{ctx_pn}]"
+                continue
+
+            # Identify child slots: all slots except the parent
+            children = {s: pns for s, pns in slots_dict.items() if s != parent_slot_name}
+
+            if not children:
+                continue
+
+            # Map each child PN to its parent
+            for child_slot, child_pns in children.items():
+                for child_pn in child_pns:
+                    k = (child_pn, lru_pn)
+                    if parent_pn not in hierarchy_map.get(k, []):
+                        hierarchy_map.setdefault(k, []).append(parent_pn)
+                    parent_slot_map[k] = parent_slot_name
+
+    def _fmt_ctx(lst):
+        return ", ".join(lst) if lst else None
+
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.struct(["new_pn", "applicable_lru_pn"])
+            .map_elements(
+                lambda r: parent_slot_map.get((r["new_pn"], r["applicable_lru_pn"])),
+                return_dtype=pl.Utf8,
+            )
+            .alias("parent_slot"),
+            pl.struct(["new_pn", "applicable_lru_pn"])
+            .map_elements(
+                lambda r: _fmt_ctx(hierarchy_map.get((r["new_pn"], r["applicable_lru_pn"]))),
+                return_dtype=pl.Utf8,
+            )
+            .alias("context_pn"),
+        ]
+    )
+
+    # display_order: parents (0) before children (1)
+    df_minimal = df_minimal.with_columns(
+        [pl.when(pl.col("parent_slot").is_not_null()).then(pl.lit(1)).otherwise(pl.lit(0)).alias("display_order")]
+    )
+
+    # indented_slot_name for UI tree display
+    # ✅ v16.3.4: Use ui_slot_key (normalized names from source datasets)
+    df_minimal = df_minimal.with_columns(
+        [
+            pl.when(pl.col("parent_slot").is_not_null() & pl.col("context_pn").is_not_null())
+            .then(
+                pl.when(pl.col("context_pn").str.contains(","))
+                .then(pl.lit("    └─ ") + pl.col("ui_slot_key") + pl.lit(" (for multiple parents)"))
+                .otherwise(
+                    pl.lit("    └─ ")
+                    + pl.col("ui_slot_key")
+                    + pl.lit(" (for ")
+                    + pl.col("parent_slot")
+                    + pl.lit(" = ")
+                    + pl.col("context_pn")
+                    + pl.lit(")")
+                )
+            )
+            .when(pl.col("parent_slot").is_not_null())
+            .then(pl.lit("    └─ ") + pl.col("ui_slot_key"))
+            .otherwise(pl.col("ui_slot_key"))
+            .alias("indented_slot_name")
+        ]
+    )
+
+    output.write_table(df_minimal)
