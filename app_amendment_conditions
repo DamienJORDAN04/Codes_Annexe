@@ -2,12 +2,17 @@
 Output Dataset: Amendment Conditions Detail
 
 Lightweight dataset for amendment conditions display.
-Used for: "What are the detailed conditions for Amendment A?"
+Used for: "What are the detailed conditions for a rule?"
 
 OPTIMIZED FOR SCALE:
-- Only 9 essential columns
+- Only essential columns
 - Small dataset (~50-300 rows)
 - Fast queries
+
+v16.0: Removed 'description' column — no longer present upstream.
+       'amendment_key' renamed to 'rule_key' to match new schema.
+v16.1: Restored amdt_name, warning_text, description, supersedes — now propagated
+       from rules_amendments source through amendment_conditions.
 
 Input: amendment_conditions
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_conditions
@@ -18,34 +23,31 @@ from transforms.api import Input, Output, transform, LightweightInput, Lightweig
 
 
 @transform.using(
-    output=Output(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_conditions"
-    ),
-    conditions=Input(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_conditions"
-    ),
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/outputs/app_amendment_conditions"),
+    conditions=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/amendment_conditions"),
 )
 def compute(conditions: LightweightInput, output: LightweightOutput) -> None:
     """
     Minimal amendment conditions lookup.
 
     Contains ONLY conditions display info:
-    1. Required slots
+    1. Required slots (including BAC for FCPC LA2K2 STD rules)
     2. Conditions summary
     3. Context dependencies (case count)
+    4. amdt_name, warning_text, description, supersedes (restored in v16.1)
 
-    Query pattern: WHERE amendment_key = 'LRU::AMDT'
+    Query pattern: WHERE rule_key = 'LRU::RULE_ID'
     """
 
     df = conditions.polars(lazy=True)
 
-    # Select ONLY essential columns (9 columns max)
+    # Select ONLY essential columns
     df_minimal = df.select(
         [
             # Keys
-            "amendment_key",
+            "rule_key",
             "target_lru_pn",
-            "amendment_name",
+            "rule_id",
             # Conditions
             "conditions_formatted",
             "conditions_summary",
@@ -53,15 +55,20 @@ def compute(conditions: LightweightInput, output: LightweightOutput) -> None:
             # Context
             "case_count",
             "mandatory_slots_count",
-            # Display
+            # Metadata
+            "unit",
+            # Rule details (restored v16.1)
+            "amdt_name",
+            "warning_text",
             "description",
+            "supersedes",
         ]
     )
 
-    # Remove duplicates (should be one row per amendment_key)
-    df_minimal = df_minimal.unique(subset=["amendment_key"], maintain_order=True)
+    # Remove duplicates (should be one row per rule_key)
+    df_minimal = df_minimal.unique(subset=["rule_key"], maintain_order=True)
 
-    # Sort by LRU and amendment
-    df_minimal = df_minimal.sort(["target_lru_pn", "amendment_name"])
+    # Sort by LRU and rule
+    df_minimal = df_minimal.sort(["target_lru_pn", "rule_id"])
 
     output.write_table(df_minimal)
