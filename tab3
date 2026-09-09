@@ -1,6 +1,93 @@
 with tab3:
     st.markdown("### 📦 LRU Configurator")
 
+    # ============================================================
+    # ✨ S7 AUTO-FILL SECTION
+    # ============================================================
+    st.markdown("---")
+    st.markdown("## 🔍 S7 Auto-Fill (Optional)")
+    st.caption("🚀 Enter an S7 notification number to instantly auto-configure the LRU with cards and amendments")
+
+    # ✅ S7 auto-fill functions are now integrated directly in tab3.py
+    # No need to import from external module
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        notification = st.text_input(
+            "S7 Notification Number:",
+            placeholder="e.g., 600000049 or 000600000049",
+            help="Enter with any number of leading zeros. All formats are supported.",
+            key="s7_notification_input",
+        )
+
+    with col2:
+        st.markdown("", unsafe_allow_html=True)
+        search_clicked = st.button("🔍 Load Configuration", type="primary", use_container_width=True)
+
+    # ✅ SOLUTION : Vérifier qu'on n'a pas déjà traité cette recherche
+    if search_clicked and notification:
+        # ✅ Empêcher le retraitement de la même recherche
+        if st.session_state.get("last_s7_processed") != notification:
+            with st.spinner("🔎 Searching S7 database..."):
+                result = autofill_from_s7(notification)
+
+            if result["success"]:
+                # Display success message
+                st.success(f"✅ {result['message']}")
+
+                # Display metadata in info box
+                meta = result["metadata"]
+                st.info(
+                    f"**LRU:** {result['lru_display_name']} ({result['lru_pn']})\n\n"
+                    f"**MSN:** {meta['msn']} | **IMMAT:** {meta['immat']} | **CLIENT:** {meta['client_name']}\n\n"
+                    f"**Cards:** {meta['num_cards']} | **Amendments:** {meta['num_amendments']} | "
+                    f"**Date:** {meta['creation_date']}"
+                )
+
+                # ✅ Marquer cette notification comme traitée
+                st.session_state["last_s7_processed"] = notification
+
+                # ✅ AUTO-FILL SESSION STATE
+                # Pre-select LRU (will trigger reset on next render)
+                st.session_state["s7_autofill_lru"] = result["lru_pn"]
+
+                # Pre-fill amendments
+                st.session_state["s7_autofill_amendments"] = result["amendments"]
+
+                # ✅ Snapshot des amendements S7 : le flag s7_autofill_amendments est
+                # CONSOMMÉ (pop) plus haut lors du rendu des cases à cocher, AVANT que
+                # l'on calcule l'auto-fill des slots hiérarchiques (qui a besoin de
+                # connaître les amendements). On garde donc une copie persistante ici.
+                st.session_state["s7_autofill_amendments_snapshot"] = list(result["amendments"])
+
+                # Pre-fill cards
+                st.session_state["s7_autofill_cards"] = result["slot_configuration"]
+
+                # Pre-fill metadata for display
+                st.session_state["s7_autofill_metadata"] = meta
+
+                # ✅ RERUN seulement si nécessaire (quand les autres widgets doivent se mettre à jour)
+                st.rerun()
+            else:
+                st.error(f"❌ {result['message']}")
+
+                # ✅ Show tried formats for debugging
+                normalized = normalize_notification_number(notification)
+                if normalized:
+                    try:
+                        num_int = int(normalized)
+                        st.caption(
+                            f"💡 Tried formats: `{num_int:09d}`, `{num_int:010d}`, `{num_int:011d}`, `{num_int:012d}`"
+                        )
+                    except Exception:
+                        pass
+
+                st.markdown("---")
+
+    # ============================================================
+    # END S7 AUTO-FILL SECTION
+    # ============================================================
+
     df_slots = load_slot_options()
     df_validation = load_validation()
 
@@ -11,7 +98,24 @@ with tab3:
             st.markdown("#### Configuration")
 
             lru_list = sorted(df_slots["applicable_lru_pn"].unique())
-            selected_lru_tab3 = st.selectbox("Select Target LRU", [""] + lru_list, key="lru_selector_tab3")
+
+            # ✅ v17.0: Check if LRU should be pre-selected from S7 auto-fill
+            default_lru = ""
+            if "s7_autofill_lru" in st.session_state:
+                default_lru = st.session_state.s7_autofill_lru
+                # Clear the flag so it only triggers once
+                st.session_state.pop("s7_autofill_lru", None)
+
+            # Find index for pre-selection
+            lru_options_list = [""] + lru_list
+            default_index = lru_options_list.index(default_lru) if default_lru in lru_options_list else 0
+
+            selected_lru_tab3 = st.selectbox(
+                "Select Target LRU",
+                lru_options_list,
+                index=default_index,
+                key="lru_selector_tab3",
+            )
 
             # ✅ v15.2.15: Reset complet quand le LRU change
             # Doit être fait AVANT le rendu des widgets enfants pour que les
@@ -25,20 +129,39 @@ with tab3:
                     "prev_wired_assy_tab3",
                     "prev_blc_tab3",
                     "prev_bmc_tab3",
+                    "prev_bac_tab3",
                     "debug_all_cases",
                     "debug_surviving_cases",
                     "debug_intersection_allowed_pns",
                     "debug_combined_amendments",
                     "debug_hierarchical_filter",
+                    "debug_group_filter",
                 ]
                 for k in keys_to_clear:
                     st.session_state.pop(k, None)
 
-                # Réinitialiser les checkboxes amendements de l'ANCIEN LRU
-                if prev_lru:
-                    old_amdts = get_available_amendments_tab3(df_slots, prev_lru)
-                    for amdt in old_amdts:
-                        st.session_state.pop(f"amdt_tab3_{amdt}", None)
+                # ✅ FIX: Réinitialiser TOUTES les checkboxes amendements (pas seulement celles de l'ancien LRU)
+                # Car les amendements peuvent être partagés entre LRUs (A, B, C, etc.)
+                # NOTE: on efface aussi les anciennes clés "amdt_tab3_" (legacy) et
+                # "amdt_cb_" (nouveau schéma). Les clés amdt_cb_ seront ré-initialisées
+                # correctement lors du rendu (à partir de selected_amdts_state_tab3,
+                # elle-même alimentée par l'auto-fill S7).
+                amdt_keys = [
+                    k for k in list(st.session_state.keys()) if k.startswith("amdt_tab3_") or k.startswith("amdt_cb_")
+                ]
+                for k in amdt_keys:
+                    st.session_state.pop(k, None)
+
+                # ✅ FIX S7: réinitialiser la source de vérité des amendements sélectionnés.
+                # IMPORTANT : ne PAS l'effacer si un auto-fill S7 est en attente
+                # (le flag s7_autofill_amendments sera consommé juste après pour
+                # ré-alimenter cet état avec les bons amendements).
+                if "s7_autofill_amendments" in st.session_state:
+                    st.session_state["selected_amdts_state_tab3"] = {
+                        a for a in st.session_state["s7_autofill_amendments"]
+                    }
+                else:
+                    st.session_state["selected_amdts_state_tab3"] = set()
 
                 # Réinitialiser les dropdowns de slots (toutes les clés slot_tab3_*)
                 slot_keys = [k for k in list(st.session_state.keys()) if k.startswith("slot_tab3_")]
@@ -60,12 +183,19 @@ with tab3:
                     lru_name = str(lru_row.get("unit", "Unknown LRU"))
                     stock_icon = str(lru_row.get("stock_status_icon", "❌"))
                     stock_summary = str(lru_row.get("lru_stock_summary", "No stock data"))
-
                     st.markdown(
                         f'<div class="blue-banner">{stock_icon} <strong>{lru_name}</strong> ({selected_lru_tab3})<br>{stock_summary}</div>',
                         unsafe_allow_html=True,
                     )
-                    st.markdown("---")
+
+                    # ✅ v17.0: Show S7 metadata if available
+                    if "s7_autofill_metadata" in st.session_state:
+                        meta = st.session_state["s7_autofill_metadata"]
+                        st.markdown(
+                            f'<div class="production-highlight">📋 S7 Context: MSN {meta["msn"]} | {meta["immat"]} | {meta["client_name"]} | {meta["creation_date"]}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown("---")
 
                 st.markdown("#### 🔖 Base LRU Amendment Configuration")
 
@@ -77,25 +207,96 @@ with tab3:
                 if available_amdts:
                     st.write("Select amendment(s):")
 
-                    # ✅ v15.2.8: First pass - collect checked amendments
-                    selected_amendments_tab3 = []
-                    for amdt in available_amdts:
-                        if st.session_state.get(f"amdt_tab3_{amdt}", False):
-                            selected_amendments_tab3.append(amdt)
+                    # ─────────────────────────────────────────────────────
+                    # ✅ FIX S7 CHECKBOXES (Streamlit 1.28.0)
+                    #
+                    # Règle Streamlit 1.28.0 : quand un widget a un `key=`, sa
+                    # valeur affichée provient de st.session_state[key]. Le
+                    # paramètre `value=` n'est utilisé QUE lors du tout premier
+                    # rendu, quand la clé n'existe pas encore. Écrire
+                    # st.session_state[key] = True AVANT le premier rendu du
+                    # widget FONCTIONNE (le widget prend cette valeur). Ce qui ne
+                    # marchait pas avant, c'est qu'on écrivait la clé puis le bloc
+                    # de reset du LRU (déclenché par la pré-sélection S7) effaçait
+                    # cette clé juste après.
+                    #
+                    # Solution : pour CHAQUE case, on initialise
+                    # st.session_state[key] AVANT st.checkbox — mais uniquement si
+                    # la clé n'existe pas déjà — à partir de la source de vérité
+                    # `selected_amdts_state_tab3` (elle-même alimentée par S7).
+                    # ─────────────────────────────────────────────────────
+                    if "selected_amdts_state_tab3" not in st.session_state:
+                        st.session_state["selected_amdts_state_tab3"] = set()
 
-                    # ✅ v15.2.8: Calculate disabled amendments (bidirectional supersedes)
+                    # ✅ Injecter les amendements S7 dans l'état (une seule fois)
+                    if "s7_autofill_amendments" in st.session_state:
+                        s7_amendments = list(st.session_state["s7_autofill_amendments"])
+
+                        matched = [a for a in s7_amendments if a in available_amdts]
+                        unmatched = [a for a in s7_amendments if a not in available_amdts]
+
+                        # Alimente la source de vérité
+                        st.session_state["selected_amdts_state_tab3"] = set(matched)
+
+                        # ⚠️ Forcer aussi les clés de widgets MAINTENANT, avant leur
+                        # premier rendu, pour que les cases s'affichent cochées.
+                        # On efface d'abord toutes les anciennes clés de case puis on
+                        # (re)crée uniquement celles qui doivent être cochées.
+                        for _k in [k for k in list(st.session_state.keys()) if k.startswith("amdt_cb_")]:
+                            st.session_state.pop(_k, None)
+                        for _amdt in matched:
+                            st.session_state[f"amdt_cb_{selected_lru_tab3}_{_amdt}"] = True
+
+                        # Consommer le flag (une seule fois)
+                        st.session_state.pop("s7_autofill_amendments", None)
+
+                        if matched:
+                            st.info(f"🔄 Auto-selected amendments from S7: {', '.join(matched)}")
+                        if unmatched:
+                            st.warning(f"⚠️ Amendments from S7 not available for this LRU: {', '.join(unmatched)}")
+
+                    # Amendements désactivés (supersedes bidirectionnel) calculés
+                    # à partir des cases actuellement cochées (via leur clé de widget).
+                    _currently_checked = [
+                        amdt
+                        for amdt in available_amdts
+                        if st.session_state.get(f"amdt_cb_{selected_lru_tab3}_{amdt}", False)
+                    ]
                     disabled_amendments = get_superseded_amendments_bidirectional(
-                        selected_amendments_tab3, selected_lru_tab3, df_amendment_rules_tab3
+                        sorted(_currently_checked),
+                        selected_lru_tab3,
+                        df_amendment_rules_tab3,
                     )
 
-                    # ✅ v15.2.8: Second pass - display checkboxes with disabled state and lock emoji
+                    # Rendu des checkboxes. La valeur vient de st.session_state[key]
+                    # (source de vérité en 1.28.0). On NE passe PAS value= pour ne
+                    # pas déclencher l'avertissement "value ignored".
                     cols = st.columns(min(6, len(available_amdts)))
                     for idx, amdt in enumerate(available_amdts):
                         with cols[idx % len(cols)]:
+                            widget_key = f"amdt_cb_{selected_lru_tab3}_{amdt}"
+                            # Initialiser la clé si absente (premier rendu de ce LRU)
+                            if widget_key not in st.session_state:
+                                st.session_state[widget_key] = amdt in st.session_state["selected_amdts_state_tab3"]
+
                             is_disabled = amdt in disabled_amendments
-                            # ✅ v15.2.8: Add lock emoji 🔒 for disabled amendments
                             label = f"🔒 {amdt}" if is_disabled else amdt
-                            st.checkbox(label, key=f"amdt_tab3_{amdt}", disabled=is_disabled)
+                            st.checkbox(
+                                label,
+                                disabled=is_disabled,
+                                key=widget_key,
+                            )
+
+                    # Liste finale : lue depuis les clés de widgets (état réel des cases)
+                    selected_amendments_tab3 = sorted(
+                        amdt
+                        for amdt in available_amdts
+                        if st.session_state.get(f"amdt_cb_{selected_lru_tab3}_{amdt}", False)
+                        and amdt not in disabled_amendments
+                    )
+
+                    # Garder la source de vérité synchronisée
+                    st.session_state["selected_amdts_state_tab3"] = set(selected_amendments_tab3)
 
                     if selected_amendments_tab3:
                         st.success(f"✅ LRU Base: {', '.join(selected_amendments_tab3)}")
@@ -119,7 +320,10 @@ with tab3:
 
                             # Display warnings immediately (no rerun)
                             if warnings:
-                                with st.expander("ℹ️ Auto-fill Applied - Click to see details", expanded=False):
+                                with st.expander(
+                                    "ℹ️ Auto-fill Applied - Click to see details",
+                                    expanded=False,
+                                ):
                                     for warning in warnings:
                                         if "🔄" in warning:
                                             st.info(warning)
@@ -139,6 +343,70 @@ with tab3:
                 if "selected_cards_tab3" not in st.session_state:
                     st.session_state.selected_cards_tab3 = {}
 
+                # ✅ v17.0: Merge S7 auto-fill cards into session state
+                # ✅ FIX (WIRED_ASSY / BLC / BMC / BAC): les slots HIÉRARCHIQUES ne
+                # lisent PAS leur valeur depuis selected_cards_tab3 mais depuis la clé
+                # de widget st.session_state["slot_tab3_<slot>"] (via current_hier_cards
+                # plus bas). Il ne suffit donc PAS de remplir selected_cards_tab3 : il
+                # faut aussi pré-positionner la clé de widget de chaque dropdown
+                # hiérarchique AVANT son premier rendu, exactement comme on le fait pour
+                # les cases d'amendement. On mémorise ces PN dans un flag dédié
+                # (s7_hier_pending) consommé lors de la construction de current_hier_cards.
+                if "s7_autofill_cards" in st.session_state:
+                    s7_cards = st.session_state["s7_autofill_cards"]
+                    # Update selected_cards_tab3 with S7 data (slots non-hiérarchiques)
+                    st.session_state.selected_cards_tab3.update(s7_cards)
+
+                    # ✅ FIX FWC + amendements : le S7 ne fournit PAS de PN pour les slots
+                    # hiérarchiques (WIRED_ASSY / BLC / BMC / BAC / ...). C'est à
+                    # l'application de les CALCULER à partir des amendements sélectionnés.
+                    # On détermine les slots hiérarchiques dynamiquement (aucun hardcode)
+                    # et on pré-remplit chaque slot :
+                    #   - avec la meilleure carte imposée par les amendements (config
+                    #     cohérente via context_pn), OU
+                    #   - avec la config STANDARD cohérente si aucun amendement n'impose
+                    #     de carte sur ce slot.
+                    # get_available_amendments_tab3 : liste des amendements dispo pour ce LRU.
+                    _s7_amdts_for_hier = [
+                        a
+                        for a in list(st.session_state.get("s7_autofill_amendments_snapshot", []))
+                        if a in get_available_amendments_tab3(df_slots, selected_lru_tab3)
+                    ]
+
+                    hier_autofill = autofill_hierarchical_slots_for_amendments(
+                        selected_amendments=_s7_amdts_for_hier,
+                        lru_pn=selected_lru_tab3,
+                        df_slots=df_slots,
+                        df_amendment_rules=df_amendment_rules_tab3,
+                        existing_hier_cards={
+                            slot: pn for slot, pn in s7_cards.items() if slot in HIERARCHICAL_SLOTS and pn
+                        },
+                    )
+
+                    # Les PN hiérarchiques fournis DIRECTEMENT par le S7 restent
+                    # prioritaires ; on complète avec ceux calculés depuis les amendements.
+                    s7_hier_pending_dict = {
+                        slot: pn for slot, pn in s7_cards.items() if slot in HIERARCHICAL_SLOTS and pn
+                    }
+                    for slot, pn in hier_autofill.items():
+                        s7_hier_pending_dict.setdefault(slot, pn)
+
+                    st.session_state["s7_hier_pending"] = s7_hier_pending_dict
+
+                    # ✅ FIX "tout se reset quand je change un dropdown" :
+                    # L'auto-fill S7 remplit potentiellement les 3 slots hiérarchiques
+                    # d'un coup. Le bloc AUTO-RESET (plus bas) vide les 2 autres slots
+                    # dès qu'UN slot change alors que les 3 étaient remplis. Comme
+                    # l'auto-fill vient de les remplir, le tout premier changement
+                    # manuel effacerait tout et obligerait à recommencer.
+                    # → On pose un flag pour NEUTRALISER le reset croisé au(x) prochain(s)
+                    #   render(s), le temps que l'utilisateur commence à interagir.
+                    st.session_state["s7_hier_just_filled"] = True
+
+                    # Clear the flags (consommés une seule fois)
+                    st.session_state.pop("s7_autofill_cards", None)
+                    st.session_state.pop("s7_autofill_amendments_snapshot", None)
+
                 # ─────────────────────────────────────────────────────────
                 # ✅ v15.2.12 KEY FIX: Read hierarchical slot values directly
                 # from Streamlit widget session state (st.session_state["slot_tab3_X"])
@@ -151,12 +419,26 @@ with tab3:
                         return None
                     return raw_value.split(" - ")[0].strip()
 
+                # ✅ FIX S7 (WIRED_ASSY / BLC / BMC / BAC): récupérer les PN hiérarchiques
+                # que l'auto-fill S7 a mis en attente. On NE peut PAS écrire directement
+                # la clé de widget slot_tab3_<slot> car un st.selectbox exige que la
+                # valeur stockée soit EXACTEMENT l'une de ses options (le label complet
+                # "PN - designation"), or nous n'avons ici que le PN. On garde donc ces
+                # PN de côté et on les injecte dans current_hier_cards (utilisé par le
+                # filtrage) ET on les utilisera comme valeur par défaut du dropdown via
+                # build_slot_labels_and_index (matching sur le PN).
+                s7_hier_pending = st.session_state.pop("s7_hier_pending", {}) or {}
+
                 # Build current hierarchical selections from live widget state
                 current_hier_cards = {}
                 for h_slot in HIERARCHICAL_SLOTS:
                     widget_key = f"slot_tab3_{h_slot}"
                     raw = st.session_state.get(widget_key, "")
                     pn = extract_pn_from_widget_value(raw)
+                    # Si le widget n'a pas encore de valeur mais que S7 a fourni un PN
+                    # pour ce slot hiérarchique, on l'utilise (auto-fill S7).
+                    if not pn and h_slot in s7_hier_pending:
+                        pn = s7_hier_pending[h_slot]
                     if pn:
                         current_hier_cards[h_slot] = pn
 
@@ -167,59 +449,184 @@ with tab3:
                     if k not in HIERARCHICAL_SLOTS:
                         selected_cards_tab3[k] = v
                 selected_cards_tab3.update(current_hier_cards)
+
                 # ─────────────────────────────────────────────────────────
                 # ✅ v15.2.14: AUTO-RESET — quand l'un des 3 slots hiérarchiques
                 # change alors que les 3 étaient remplis, vider les 2 autres.
-                # Règle :
-                #   - WIRED_ASSY change → reset BLC + BMC  (comportement historique)
-                #   - BLC change        → reset WIRED_ASSY + BMC  (nouveau)
-                #   - BMC change        → reset WIRED_ASSY + BLC  (nouveau)
-                # Si moins de 3 slots étaient remplis, on garde le comportement
-                # précédent (seul WIRED_ASSY déclenche un reset des enfants).
                 # ─────────────────────────────────────────────────────────
                 prev_wired_assy = st.session_state.get("prev_wired_assy_tab3", None)
                 prev_blc = st.session_state.get("prev_blc_tab3", None)
                 prev_bmc = st.session_state.get("prev_bmc_tab3", None)
+                prev_bac = st.session_state.get("prev_bac_tab3", None)
 
                 curr_wired_assy = current_hier_cards.get("WIRED_ASSY", None)
                 curr_blc = current_hier_cards.get("BLC", None)
                 curr_bmc = current_hier_cards.get("BMC", None)
+                curr_bac = current_hier_cards.get("BAC", None)
 
-                # Detect which slot changed (None → value counts as "just filled", not a change)
+                # Determine which child slots actually exist for this LRU
+                _lru_slot_names = (
+                    set(df_slots[df_slots["applicable_lru_pn"] == selected_lru_tab3]["physical_slot_name"].dropna())
+                    if selected_lru_tab3
+                    else set()
+                )
+                _has_bac_slot = "BAC" in _lru_slot_names
+
+                # Detect which slot changed
                 wa_changed = prev_wired_assy is not None and curr_wired_assy != prev_wired_assy
                 blc_changed = prev_blc is not None and curr_blc != prev_blc
                 bmc_changed = prev_bmc is not None and curr_bmc != prev_bmc
+                bac_changed = prev_bac is not None and curr_bac != prev_bac
 
-                # All 3 were filled in the previous cycle?
-                all_three_were_filled = prev_wired_assy is not None and prev_blc is not None and prev_bmc is not None
+                # All hierarchical slots (relevant to this LRU) were filled in the previous cycle?
+                _all_children_filled = (
+                    prev_blc is not None and prev_bmc is not None and (prev_bac is not None if _has_bac_slot else True)
+                )
+                all_hier_were_filled = prev_wired_assy is not None and _all_children_filled
 
                 def _clear_hier_slots(*slots_to_clear):
-                    """Helper: remove slots from every working dict."""
+                    """Helper: remove slots from every working dict + widget state."""
                     for s in slots_to_clear:
                         st.session_state.selected_cards_tab3.pop(s, None)
                         selected_cards_tab3.pop(s, None)
                         current_hier_cards.pop(s, None)
+                        # Le widget lit sa valeur depuis slot_tab3_<slot> ; on l'efface
+                        # aussi pour que le dropdown se vide réellement.
+                        st.session_state.pop(f"slot_tab3_{s}", None)
 
-                if all_three_were_filled:
-                    # When all 3 were filled, any change resets the other 2
-                    if wa_changed:
-                        _clear_hier_slots("BLC", "BMC")
-                    elif blc_changed:
-                        _clear_hier_slots("WIRED_ASSY", "BMC")
-                    elif bmc_changed:
-                        _clear_hier_slots("WIRED_ASSY", "BLC")
+                # ─────────────────────────────────────────────────────────
+                # ✅ v18 — RESET INTELLIGENT (option C, piloté par context_pn)
+                #
+                # Ancien comportement : dès qu'UN slot hiérarchique changeait alors que
+                # les slots étaient remplis, on VIDAIT tous les autres → l'utilisateur
+                # devait tout recommencer.
+                #
+                # Nouveau comportement demandé :
+                #   - Quand on change UNE carte hiérarchique, on GARDE toutes les autres
+                #     cartes hiérarchiques qui restent COMPATIBLES (même contexte /
+                #     context_pn) avec la nouvelle sélection globale.
+                #   - On ne vide QUE les slots devenus INCOMPATIBLES.
+                #
+                # Compatibilité = il existe au moins un context_pn (config cohérente)
+                # partagé par TOUTES les cartes hiérarchiques encore sélectionnées.
+                # Comme les context_pn peuvent décrire des configs totalement
+                # différentes, changer une carte peut rendre une autre incompatible :
+                # dans ce cas seulement on la retire.
+                #
+                # ⚠️ AUCUN hardcode de nom de slot : on utilise la détection dynamique.
+                # ─────────────────────────────────────────────────────────
+                _skip_cross_reset = st.session_state.pop("s7_hier_just_filled", False)
+
+                _hier_info_reset = get_hierarchical_slots_for_lru(selected_lru_tab3, df_slots)
+                _parent_slots_reset = _hier_info_reset["parent_slots"]
+                _child_slots_reset = _hier_info_reset["child_slots"]
+                _lru_data_reset = df_slots[df_slots["applicable_lru_pn"] == selected_lru_tab3]
+
+                def _ctx_list_reset(slot_name, card_pn):
+                    """context_pn_list d'une carte enfant pour ce slot (liste, jamais None)."""
+                    if not card_pn:
+                        return []
+                    rows = _lru_data_reset[
+                        (_lru_data_reset["physical_slot_name"] == slot_name) & (_lru_data_reset["new_pn"] == card_pn)
+                    ]
+                    if rows.empty:
+                        return []
+                    val = rows.iloc[0].get("context_pn_list", [])
+                    return val if isinstance(val, list) else []
+
+                # Détecter quel(s) slot(s) l'utilisateur vient de changer (hors S7).
+                _changed_map = {
+                    "WIRED_ASSY": wa_changed,
+                    "BLC": blc_changed,
+                    "BMC": bmc_changed,
+                    "BAC": bac_changed,
+                }
+                _any_user_change = any(_changed_map.get(s, False) for s in _hier_info_reset["all_hierarchical"])
+
+                if _skip_cross_reset or not _any_user_change:
+                    # Auto-fill S7 tout juste appliqué, OU aucun changement hiérarchique
+                    # de l'utilisateur → on ne touche à rien.
+                    pass
                 else:
-                    # Legacy behaviour: only WIRED_ASSY change resets children
-                    if wa_changed:
-                        _clear_hier_slots("BLC", "BMC")
+                    # L'utilisateur a changé au moins une carte hiérarchique.
+                    # On détermine l'ensemble des context_pn cohérents avec la sélection
+                    # ACTUELLE (parent + enfants), puis on retire uniquement les cartes
+                    # qui ne partagent AUCUN context_pn commun.
+
+                    # 1) context_pn autorisés par le PARENT choisi (WIRED_ASSY).
+                    #    Le parent EST un context_pn : s'il est choisi, l'ensemble
+                    #    cohérent démarre à {parent_pn}. Sinon (pas de parent choisi),
+                    #    on part de "tous les context_pn possibles" (= pas de contrainte
+                    #    côté parent).
+                    parent_pn_now = None
+                    for _p in _parent_slots_reset:
+                        parent_pn_now = current_hier_cards.get(_p)
+                        if parent_pn_now:
+                            break
+
+                    if parent_pn_now:
+                        allowed_ctx = {parent_pn_now}
+                    else:
+                        allowed_ctx = None  # None = pas de contrainte parent
+
+                    # 2) Intersecter avec les context_pn de chaque ENFANT encore choisi.
+                    for _c in _child_slots_reset:
+                        c_pn = current_hier_cards.get(_c)
+                        if not c_pn:
+                            continue
+                        c_ctx = set(_ctx_list_reset(_c, c_pn))
+                        if allowed_ctx is None:
+                            allowed_ctx = c_ctx
+                        else:
+                            allowed_ctx = allowed_ctx & c_ctx
+
+                    # 3) Si l'intersection est vide → les cartes sélectionnées sont
+                    #    mutuellement incompatibles. On retire les enfants incompatibles
+                    #    avec le PARENT courant (priorité au parent = context_pn racine),
+                    #    et si c'est un enfant qui vient de changer, on garde ce nouvel
+                    #    enfant et on retire ceux qui n'ont plus de contexte commun.
+                    if allowed_ctx is not None and len(allowed_ctx) == 0:
+                        # Déterminer le slot que l'utilisateur vient de changer (référence).
+                        changed_slot = None
+                        for s in _hier_info_reset["all_hierarchical"]:
+                            if _changed_map.get(s, False):
+                                changed_slot = s
+                                break
+
+                        # Contexte de référence = celui de la carte qui vient de changer.
+                        if changed_slot in _parent_slots_reset:
+                            ref_ctx = {current_hier_cards.get(changed_slot)}
+                        elif changed_slot:
+                            ref_ctx = set(_ctx_list_reset(changed_slot, current_hier_cards.get(changed_slot)))
+                        else:
+                            ref_ctx = set()
+
+                        # Vider chaque AUTRE slot hiérarchique incompatible avec ref_ctx.
+                        for s in _hier_info_reset["all_hierarchical"]:
+                            if s == changed_slot:
+                                continue
+                            s_pn = current_hier_cards.get(s)
+                            if not s_pn:
+                                continue
+                            if s in _parent_slots_reset:
+                                # parent compatible si son PN ∈ ref_ctx
+                                if s_pn not in ref_ctx:
+                                    _clear_hier_slots(s)
+                            else:
+                                s_ctx = set(_ctx_list_reset(s, s_pn))
+                                if not (s_ctx & ref_ctx):
+                                    _clear_hier_slots(s)
+                    # Sinon (intersection non vide ou pas de contrainte) : tout reste
+                    # cohérent → on NE vide RIEN. C'est le cœur de l'option C.
 
                 # Persist current values for the next render cycle
                 st.session_state.prev_wired_assy_tab3 = current_hier_cards.get("WIRED_ASSY", None)
                 st.session_state.prev_blc_tab3 = current_hier_cards.get("BLC", None)
                 st.session_state.prev_bmc_tab3 = current_hier_cards.get("BMC", None)
+                st.session_state.prev_bac_tab3 = current_hier_cards.get("BAC", None)
+
                 # ─────────────────────────────────────────────────────────
-                # ✅ v15.2.12: Compute hierarchical filter NOW, with current
-                # widget values — works with AND without amendments checked
+                # ✅ v15.2.12: Compute hierarchical filter NOW
                 # ─────────────────────────────────────────────────────────
                 hierarchical_filter = filter_hierarchical_slots_bidirectional_tab3(
                     current_hier_cards, df_slots, selected_lru_tab3
@@ -229,16 +636,30 @@ with tab3:
                 st.session_state.debug_hierarchical_filter = hierarchical_filter
 
                 # ─────────────────────────────────────────────────────────
+                # ✅ v16.4: Compute group-based filter (for IO_CARDS, CPU, etc.)
+                # ─────────────────────────────────────────────────────────
+                df_groups_metadata_tab3 = load_slot_groups_metadata()
+                group_filter = filter_slots_by_group_prefix(
+                    selected_cards_tab3,
+                    selected_lru_tab3,
+                    df_slots,
+                    df_groups_metadata_tab3,
+                )
+
+                # Store for debugging
+                st.session_state.debug_group_filter = group_filter
+
+                # ─────────────────────────────────────────────────────────
                 # Build lru_options (amendment filtering)
                 # ─────────────────────────────────────────────────────────
                 lru_options = df_slots[df_slots["applicable_lru_pn"] == selected_lru_tab3].copy()
                 lru_options = lru_options.drop_duplicates(subset=["physical_slot_name", "new_pn"], keep="first")
 
-                # ✅ v15.2.8: Apply filtering for selected amendments with mandatory slots logic
                 if selected_amendments_tab3:
-                    # Get combined mandatory slots for filtering
                     mandatory_slots_dict = get_combined_mandatory_slots_tab3(
-                        selected_amendments_tab3, selected_lru_tab3, df_amendment_rules_tab3
+                        selected_amendments_tab3,
+                        selected_lru_tab3,
+                        df_amendment_rules_tab3,
                     )
 
                     mask = pd.Series([False] * len(lru_options), index=lru_options.index)
@@ -249,31 +670,34 @@ with tab3:
                         amdt = str(row.get("amendment_letter", ""))
                         compat = str(row.get("compatibility_level", ""))
 
-                        # Check if this slot is mandatory
                         is_mandatory_slot = slot_name in mandatory_slots_dict
 
                         if is_mandatory_slot:
-                            # MANDATORY SLOT: Only show cards in allowed_pns (NO STD)
                             allowed_pns = mandatory_slots_dict[slot_name]["allowed_pns"]
                             if card_pn in allowed_pns:
                                 mask.loc[idx] = True
                         else:
-                            # NON-MANDATORY SLOT: Only show STD cards
+                            is_std_card = False
+                            is_amdt_compatible = False
+
                             if "STD" in compat.upper():
-                                mask.loc[idx] = True
+                                is_std_card = True
                             elif amdt and amdt != "None":
-                                # Check if card has STD in amendment_letter
                                 card_amdts = [a.strip().upper() for a in amdt.split(",")]
                                 if "STD" in card_amdts:
-                                    mask.loc[idx] = True
+                                    is_std_card = True
+
+                            if amdt and amdt != "None":
+                                card_amdts_normalized = [a.strip() for a in amdt.split(",")]
+                                if any(a in card_amdts_normalized for a in selected_amendments_tab3):
+                                    is_amdt_compatible = True
+
+                            if is_std_card or is_amdt_compatible:
+                                mask.loc[idx] = True
 
                     lru_options = lru_options[mask]
 
-                # ✅ v15.2.12 FIX: Always use physical_slot_name as slot_column
-                # so slot_name in slots_data always matches HIERARCHICAL_SLOTS keys
-                # ("WIRED_ASSY", "BLC", "BMC") and apply_all_filters_to_slot works.
                 slot_column = "physical_slot_name"
-
                 available_slots = sorted(lru_options[slot_column].dropna().unique())
 
                 slots_data = []
@@ -339,7 +763,6 @@ with tab3:
                             }
                         grouped_slots[group]["slots"].append(slot_info)
 
-                # v15.1.5: Sort individual slots - WIRED_ASSY first, then BLC, then BMC, then others
                 slots_with_hierarchy = []
                 for slot_info in individual_slots:
                     slot_name = slot_info["slot_name"]
@@ -354,14 +777,10 @@ with tab3:
                         }
                     )
 
-                # Build sorted list with priority: WIRED_ASSY -> BLC -> BMC -> others (parent-child order)
                 individual_slots_sorted = []
                 processed_slots = set()
+                hierarchical_priority = ["WIRED_ASSY", "BLC", "BMC", "BAC"]
 
-                # Priority order for hierarchical slots
-                hierarchical_priority = ["WIRED_ASSY", "BLC", "BMC"]
-
-                # First pass: Add hierarchical slots in priority order
                 for priority_slot in hierarchical_priority:
                     for item in slots_with_hierarchy:
                         if item["slot_name"] == priority_slot and priority_slot not in processed_slots:
@@ -369,7 +788,6 @@ with tab3:
                             processed_slots.add(priority_slot)
                             break
 
-                # Second pass: Add remaining slots (preserving parent-child order)
                 for item in slots_with_hierarchy:
                     slot_name = item["slot_name"]
 
@@ -383,7 +801,8 @@ with tab3:
                         for child_name in item["children"]:
                             if child_name not in hierarchical_priority and child_name not in processed_slots:
                                 child_item = next(
-                                    (x for x in slots_with_hierarchy if x["slot_name"] == child_name), None
+                                    (x for x in slots_with_hierarchy if x["slot_name"] == child_name),
+                                    None,
                                 )
                                 if child_item:
                                     individual_slots_sorted.append(child_item["slot_info"])
@@ -392,7 +811,7 @@ with tab3:
                 individual_slots = individual_slots_sorted
 
                 # ─────────────────────────────────────────────────────────
-                # v15.1.5: HIERARCHICAL FILTERING with INTERSECTION (Amendment-based)
+                # HIERARCHICAL FILTERING with INTERSECTION (Amendment-based)
                 # ─────────────────────────────────────────────────────────
                 has_hierarchical_slots = check_if_lru_has_hierarchical_slots(selected_lru_tab3, df_slots)
 
@@ -402,20 +821,20 @@ with tab3:
                 combined_amendments_info = None
 
                 if has_hierarchical_slots:
-                    # STEP 1: Extract all CASES
                     all_cases = extract_all_cases(
                         lru_pn=selected_lru_tab3,
                         selected_amendments=selected_amendments_tab3,
                         df_amendment_rules=df_amendment_rules_tab3,
+                        df_slots=df_slots,
                     )
 
-                    # STEP 2: Filter surviving CASES
-                    surviving_cases = filter_surviving_cases(all_cases=all_cases, selected_cards=selected_cards_tab3)
+                    surviving_cases = filter_surviving_cases(
+                        all_cases=all_cases,
+                        selected_cards=selected_cards_tab3,
+                    )
 
-                    # STEP 3: Compute INTERSECTION of allowed PNs
                     intersection_allowed_pns = compute_intersection_allowed_pns(surviving_cases=surviving_cases)
 
-                    # STEP 4: Detect combined amendments (AND logic)
                     combined_amendments_info = detect_combined_amendments(
                         selected_cards=selected_cards_tab3,
                         surviving_cases=surviving_cases,
@@ -423,7 +842,6 @@ with tab3:
                         df_slots=df_slots,
                     )
 
-                    # Store debug info in session state
                     st.session_state.debug_all_cases = all_cases
                     st.session_state.debug_surviving_cases = surviving_cases
                     st.session_state.debug_intersection_allowed_pns = intersection_allowed_pns
@@ -432,61 +850,61 @@ with tab3:
                 st.markdown("---")
 
                 # DEBUG INFO
-                if has_hierarchical_slots:
-                    with st.expander("🔍 Debug: Filtering Info v15.2.12", expanded=False):
-                        debug_data = {
-                            "current_hier_cards (widget state)": current_hier_cards,
-                            "hierarchical_filter": hierarchical_filter,
-                        }
-                        if intersection_allowed_pns:
-                            debug_data.update(
-                                {
-                                    "total_cases": len(all_cases),
-                                    "surviving_cases": len(surviving_cases),
-                                    "surviving_case_ids": [c["case_id"] for c in surviving_cases]
-                                    if surviving_cases
-                                    else [],
-                                    "amendment_filter_options": {
-                                        k: len(v) for k, v in intersection_allowed_pns.items()
-                                    },
-                                    "combined_amendments": combined_amendments_info,
-                                }
+                with st.expander("🔍 Debug: Filtering Info v16.6", expanded=False):
+                    debug_data = {
+                        "selected_amendments": selected_amendments_tab3,
+                        "selected_cards": selected_cards_tab3,
+                        "current_hier_cards (widget state)": current_hier_cards,
+                        "hierarchical_filter": hierarchical_filter,
+                        "group_filter": group_filter,
+                        "mandatory_slots_dict": (
+                            get_combined_mandatory_slots_tab3(
+                                selected_amendments_tab3,
+                                selected_lru_tab3,
+                                df_amendment_rules_tab3,
                             )
-                        st.json(debug_data)
+                            if selected_amendments_tab3
+                            else {}
+                        ),
+                    }
+                    if has_hierarchical_slots and intersection_allowed_pns:
+                        debug_data.update(
+                            {
+                                "total_cases": len(all_cases),
+                                "surviving_cases": len(surviving_cases),
+                                "surviving_case_ids": [c["case_id"] for c in surviving_cases]
+                                if surviving_cases
+                                else [],
+                                "amendment_filter_options": {k: len(v) for k, v in intersection_allowed_pns.items()},
+                                "combined_amendments": combined_amendments_info,
+                            }
+                        )
+                    st.json(debug_data)
 
                 # ─────────────────────────────────────────────────────────
-                # ✅ v15.2.12: Helper to apply both amendment + hierarchical
-                # filters to slot_options, returning final allowed labels.
+                # Helper to apply ALL filters (hierarchical + group)
                 # ─────────────────────────────────────────────────────────
                 def apply_all_filters_to_slot(slot_name, slot_options_df):
-                    """
-                    Apply ONLY the bidirectional hierarchical filter (context_pn) to slot options.
-                    The amendment-based filter (intersection_allowed_pns) has been removed for
-                    hierarchical slots to avoid empty dropdowns when amendments are selected.
-                    For non-hierarchical slots, amendment filtering is already applied upstream
-                    via the lru_options mask.
-                    Returns filtered DataFrame.
-                    """
                     filtered = slot_options_df.copy()
 
-                    # ✅ v15.2.13: Only apply bidirectional hierarchical filter (context_pn).
-                    # Amendment intersection filter removed from hierarchical slots —
-                    # it was too restrictive and could leave zero options available.
                     if hierarchical_filter and slot_name in hierarchical_filter:
                         hier_allowed = hierarchical_filter[slot_name]
                         if len(hier_allowed) > 0:
                             filtered = filtered[filtered["new_pn"].isin(hier_allowed)]
                         else:
-                            # Empty list = no compatible card → return empty DataFrame
+                            filtered = filtered.iloc[0:0]
+
+                    if group_filter and slot_name in group_filter:
+                        group_allowed = group_filter[slot_name]
+                        if len(group_allowed) > 0:
+                            filtered = filtered[filtered["new_pn"].isin(group_allowed)]
+                        else:
                             filtered = filtered.iloc[0:0]
 
                     return filtered
 
                 # ─────────────────────────────────────────────────────────
-                # Helper: build labels + current index for a dropdown.
-                # For hierarchical slots: the "current value" comes from
-                # current_hier_cards (live widget state), NOT session state,
-                # so the index is always coherent with filtered options.
+                # Helper: build labels + current index for a dropdown
                 # ─────────────────────────────────────────────────────────
                 def build_slot_labels_and_index(slot_name, slot_options_filtered):
                     if "dropdown_label" in slot_options_filtered.columns:
@@ -497,8 +915,6 @@ with tab3:
                             for _, row in slot_options_filtered.iterrows()
                         ]
 
-                    # For hierarchical slots use the live widget-derived value;
-                    # for others use the persisted session state value.
                     if slot_name in HIERARCHICAL_SLOTS:
                         current_value = current_hier_cards.get(slot_name, "")
                     else:
@@ -516,7 +932,6 @@ with tab3:
                                     current_index = slot_labels.index(matching[0])
                                 except ValueError:
                                     current_index = 0
-                        # If current_value not in filtered options → fall back to 0 (blank)
 
                     return slot_labels, current_index
 
@@ -525,13 +940,11 @@ with tab3:
                 # ─────────────────────────────────────────────────────────
                 if grouped_slots:
                     for group_name, group_data in grouped_slots.items():
-                        mix_policy = group_data["mix_policy"] or "UNKNOWN"
-                        st.markdown(f"##### 🔷 {group_name} (Mix: {mix_policy})")
+                        st.markdown(f"##### 🔷 {group_name}")
 
                         for slot_info in group_data["slots"]:
                             slot_name = slot_info["slot_name"]
 
-                            # ✅ v15.2.12: Apply all filters
                             slot_options = apply_all_filters_to_slot(slot_name, slot_info["options"])
                             slot_labels, current_index = build_slot_labels_and_index(slot_name, slot_options)
 
@@ -569,21 +982,16 @@ with tab3:
                     for slot_info in individual_slots:
                         slot_name = slot_info["slot_name"]
 
-                        # ✅ v15.2.12: Apply all filters
                         slot_options = apply_all_filters_to_slot(slot_name, slot_info["options"])
                         slot_labels, current_index = build_slot_labels_and_index(slot_name, slot_options)
 
                         hierarchy_info = get_slot_hierarchy_info(slot_name, df_slots, selected_lru_tab3)
 
-                        # ✅ v15.2.9: Generate display label based on hierarchy (parent_slot)
                         if hierarchy_info["parent_slot"]:
-                            # Child slot (BLC, BMC) - indent without context_pn
                             display_label = f"  └─ {slot_name}"
                         else:
-                            # Parent or standalone slot
                             display_label = slot_name
 
-                        # Warning when no compatible cards remain for a hierarchical slot
                         if (
                             slot_name in HIERARCHICAL_SLOTS
                             and slot_options.empty
@@ -602,7 +1010,11 @@ with tab3:
                             selected_cards_tab3[slot_name] = card_pn
 
                             card_amdt_info = get_card_compatible_amendments(
-                                card_pn, selected_lru_tab3, df_slots, df_amendment_rules_tab3, physical_slot=slot_name
+                                card_pn,
+                                selected_lru_tab3,
+                                df_slots,
+                                df_amendment_rules_tab3,
+                                physical_slot=slot_name,
                             )
                             if card_amdt_info:
                                 st.markdown(
@@ -636,20 +1048,15 @@ with tab3:
                         debug=True,
                     )
 
-                    # v15.1.6 DEBUG: Show amendment extraction debug info
                     if "debug_info" in possible_config:
                         with st.expander("🐛 DEBUG: Amendment Detection", expanded=False):
                             st.json(possible_config["debug_info"])
 
                     st.markdown("---")
 
-                    # ==========================================
-                    # v15.1.8: AMENDMENTS TO APPLY SECTION WITH STD LOGIC
-                    # ==========================================
                     if len(st.session_state.selected_cards_tab3) > 0:
                         amendments_to_display = possible_config["possible_amendments"]
 
-                        # v15.1.8: Check if only STD or no amendments
                         if len(amendments_to_display) == 0 or (
                             len(amendments_to_display) == 1 and "STD" in amendments_to_display
                         ):
@@ -658,7 +1065,6 @@ with tab3:
                         elif len(amendments_to_display) > 0:
                             st.markdown("### 🎯 Amendments to Apply")
 
-                            # Check if we have combined amendments from hierarchical filtering
                             has_hierarchical_and = False
                             if "combined_amendments_info" in locals() and combined_amendments_info:
                                 if combined_amendments_info["mode"] == "combined":
@@ -672,10 +1078,8 @@ with tab3:
                                         unsafe_allow_html=True,
                                     )
                             else:
-                                # v15.1.8: Filter non-hierarchical amendments (remove STD if not valid)
                                 amendments_status = possible_config.get("amendments_status", {})
 
-                                # Separate hierarchical and non-hierarchical amendments
                                 hierarchical_amdts = []
                                 non_hierarchical_amdts = []
 
@@ -686,11 +1090,9 @@ with tab3:
                                     else:
                                         non_hierarchical_amdts.append(amdt)
 
-                                # v15.1.8: Validate STD with selected cards
                                 non_hierarchical_amdts_filtered = []
                                 for amdt in non_hierarchical_amdts:
                                     if amdt == "STD":
-                                        # Check if STD is valid with selected cards
                                         if is_std_valid_with_selected_cards(
                                             st.session_state.selected_cards_tab3,
                                             df_slots,
@@ -701,7 +1103,6 @@ with tab3:
                                     else:
                                         non_hierarchical_amdts_filtered.append(amdt)
 
-                                # Group hierarchical amendments by shared valid contexts
                                 context_groups = {}
                                 for amdt in hierarchical_amdts:
                                     valid_contexts = tuple(
@@ -711,16 +1112,15 @@ with tab3:
                                         context_groups[valid_contexts] = []
                                     context_groups[valid_contexts].append(amdt)
 
-                                # v15.1.8: Build combined amendment display (hierarchical + non-hierarchical filtered)
                                 displayed_amendments = set()
 
-                                # Display hierarchical groups
-                                for valid_contexts, amdts in context_groups.items():
+                                for (
+                                    valid_contexts,
+                                    amdts,
+                                ) in context_groups.items():
                                     if len(amdts) > 1:
-                                        # Multiple hierarchical amendments sharing contexts
                                         hierarchical_display = " AND ".join(sorted(amdts))
 
-                                        # Add non-hierarchical amendments to the display
                                         if non_hierarchical_amdts_filtered:
                                             full_display = f"{hierarchical_display} AND {' OR '.join(sorted(non_hierarchical_amdts_filtered))}"
                                             st.markdown(
@@ -736,7 +1136,6 @@ with tab3:
                                         displayed_amendments.update(amdts)
                                         displayed_amendments.update(non_hierarchical_amdts_filtered)
 
-                                # Display remaining hierarchical amendments separately
                                 remaining_hierarchical = [
                                     a for a in hierarchical_amdts if a not in displayed_amendments
                                 ]
@@ -762,7 +1161,6 @@ with tab3:
                                         displayed_amendments.add(amdt)
                                         displayed_amendments.update(non_hierarchical_amdts_filtered)
 
-                                # Display standalone non-hierarchical amendments if not already displayed
                                 if non_hierarchical_amdts_filtered and not displayed_amendments:
                                     amendment_sources = possible_config.get("amendment_sources", {})
                                     for amdt in non_hierarchical_amdts_filtered:
@@ -777,26 +1175,15 @@ with tab3:
 
                     st.markdown("### 🎯 Possible Amendments")
 
-                    # ✅ v15.2.15 FIX: Determine has_only_std_cards using the RESULT of
-                    # calculate_possible_amendments_with_conflicts(), not raw card data.
-                    #
-                    # Reasoning:
-                    # A card with amendment_letter="G, I" (multi-amdt) is used in a STD
-                    # configuration when G and I are both excluded (validity_check failed).
-                    # In that case possible_config["possible_amendments"] == ["STD"] (after
-                    # the STD-reinstatement fix in def.py).
-                    # → We simply treat the config as STD when possible_amendments ⊆ {STD, []}.
-                    #
-                    # Fallback: if possible_amendments is non-empty and non-STD, use the old
-                    # card-level check so we don't mask real amendment requirements.
                     _final_amdts = possible_config["possible_amendments"]
                     if len(_final_amdts) == 0 or (len(_final_amdts) == 1 and "STD" in _final_amdts):
-                        # possible_amendments already signals a STD/no-amendment configuration
                         has_only_std_cards = True
                     else:
-                        # There are real amendments → fall back to per-card check
                         has_only_std_cards = True
-                        for slot, card_pn in st.session_state.selected_cards_tab3.items():
+                        for (
+                            slot,
+                            card_pn,
+                        ) in st.session_state.selected_cards_tab3.items():
                             card_info = df_slots[
                                 (df_slots["applicable_lru_pn"] == selected_lru_tab3) & (df_slots["new_pn"] == card_pn)
                             ]
@@ -805,8 +1192,6 @@ with tab3:
                                 card_compat = str(card_row.get("compatibility_level", ""))
                                 card_amdt = str(card_row.get("amendment_letter", "") or "")
 
-                                # A card is STD if compatibility_level contains "STD"
-                                # AND amendment_letter is empty, "None", or literally "STD"
                                 is_std_card = "STD" in card_compat.upper() and (
                                     not card_amdt
                                     or card_amdt in ("None", "STD")
@@ -840,7 +1225,6 @@ with tab3:
                     elif len(st.session_state.selected_cards_tab3) > 0:
                         st.success("✅ CONFIGURATION VALID - Fill remaining slots to complete")
 
-                    # v15.1.8: Display expanders (with "STD - No Amendment" label)
                     if not possible_config["possible_amendments"]:
                         if has_only_std_cards or len(possible_config["conflicts"]) == 0:
                             with st.expander("📊 STD - No Amendment", expanded=True):
@@ -862,21 +1246,17 @@ with tab3:
                                 expander_label += " ⚠️"
 
                             with st.expander(expander_label, expanded=False):
-                                # ==========================================
-                                # v15.1.9: SECTION A - Description (from parsed_amendment_rules)
-                                # ==========================================
                                 st.markdown("#### 📋 Description")
                                 description = get_amendment_description_from_rules(
-                                    selected_lru_tab3, amdt, df_amendment_rules_tab3
+                                    selected_lru_tab3,
+                                    amdt,
+                                    df_amendment_rules_tab3,
                                 )
                                 if description:
                                     st.info(description)
                                 else:
                                     st.info("No description available")
 
-                                # ==========================================
-                                # v15.1.9: SECTION B - Supersedes (clean display)
-                                # ==========================================
                                 st.markdown("#### 🗑️ Supersedes")
                                 supersedes = possible_config["supersedes_by_amendment"].get(amdt, [])
                                 if supersedes:
@@ -885,44 +1265,44 @@ with tab3:
                                 else:
                                     st.info("No amendments superseded")
 
-                                # ==========================================
-                                # v15.1.9: SECTION C - Mandatory Slots (with group structure)
-                                # ==========================================
                                 st.markdown("#### 🔒 Mandatory Slots")
                                 mandatory_slots = get_mandatory_slots_from_parsed_rules(
-                                    selected_lru_tab3, amdt, df_amendment_rules_tab3
+                                    selected_lru_tab3,
+                                    amdt,
+                                    df_amendment_rules_tab3,
                                 )
 
                                 if mandatory_slots:
                                     st.warning(f"{len(mandatory_slots)} slot(s) required:")
 
-                                    # v15.1.9: Build group structure from mandatory slots
                                     group_structure = build_group_structure_for_mandatory_slots(
-                                        mandatory_slots, selected_lru_tab3, df_slots
+                                        mandatory_slots,
+                                        selected_lru_tab3,
+                                        df_slots,
                                     )
 
                                     groups = group_structure["groups"]
                                     standalone_slots = group_structure["standalone_slots"]
 
-                                    # v15.1.9: Display GROUPS first
-                                    for group_name, group_data in groups.items():
+                                    for (
+                                        group_name,
+                                        group_data,
+                                    ) in groups.items():
                                         mix_policy = group_data["mix_policy"] or "UNKNOWN"
                                         group_slots = group_data["slots"]
 
-                                        # Calculate group status
                                         group_status = calculate_group_status(
-                                            group_slots, st.session_state.selected_cards_tab3, mix_policy
+                                            group_slots,
+                                            st.session_state.selected_cards_tab3,
+                                            mix_policy,
                                         )
 
-                                        # Display group header
                                         st.markdown(f"{group_status} **{group_name}** (Mix Policy: {mix_policy})")
 
-                                        # Display slots in group
                                         for slot_info in group_slots:
                                             slot_name = slot_info["slot_name"]
                                             allowed_pns = slot_info["allowed_pns"]
 
-                                            # Check slot status
                                             slot_status = "⚪"
                                             if slot_name in st.session_state.selected_cards_tab3:
                                                 selected_pn = st.session_state.selected_cards_tab3[slot_name]
@@ -933,15 +1313,12 @@ with tab3:
 
                                             st.markdown(f"   ├─ {slot_status} **{slot_name}**")
 
-                                            # Display allowed PNs
                                             for pn in allowed_pns[:3]:
                                                 st.markdown(f"   │   └─ `{pn}`")
                                             if len(allowed_pns) > 3:
                                                 st.caption(f"   │   ... +{len(allowed_pns) - 3} more PNs")
 
-                                    # v15.1.9: Display STANDALONE SLOTS (including hierarchical WIRED_ASSY/BLC/BMC)
                                     if standalone_slots:
-                                        # Separate hierarchical from non-hierarchical standalone slots
                                         parent_slots = {}
                                         non_hierarchical_slots = []
 
@@ -949,17 +1326,14 @@ with tab3:
                                             slot_name = slot_info["slot_name"]
                                             context_pn = slot_info.get("context_pn", None)
                                             hierarchy_info = get_slot_hierarchy_info(
-                                                slot_name, df_slots, selected_lru_tab3
+                                                slot_name,
+                                                df_slots,
+                                                selected_lru_tab3,
                                             )
 
-                                            # Child slot (BLC, BMC)
                                             if hierarchy_info["parent_slot"]:
                                                 parent = hierarchy_info["parent_slot"]
-
-                                                if context_pn:
-                                                    parent_key = f"{parent}::{context_pn}"
-                                                else:
-                                                    parent_key = parent
+                                                parent_key = f"{parent}::{context_pn}" if context_pn else parent
 
                                                 if parent_key not in parent_slots:
                                                     parent_slots[parent_key] = {
@@ -975,12 +1349,8 @@ with tab3:
                                                         "context_pn": context_pn,
                                                     }
                                                 )
-                                            # Parent slot (WIRED_ASSY)
                                             elif hierarchy_info["is_parent"]:
-                                                if context_pn:
-                                                    parent_key = f"{slot_name}::{context_pn}"
-                                                else:
-                                                    parent_key = slot_name
+                                                parent_key = f"{slot_name}::{context_pn}" if context_pn else slot_name
 
                                                 if parent_key not in parent_slots:
                                                     parent_slots[parent_key] = {
@@ -990,19 +1360,18 @@ with tab3:
                                                         "context_pn": context_pn,
                                                     }
                                                 else:
-                                                    # Parent info already exists, update it
                                                     parent_slots[parent_key]["info"] = slot_info
-                                            # Non-hierarchical standalone slot
                                             else:
                                                 non_hierarchical_slots.append(slot_info)
 
-                                        # Display hierarchical slots (WIRED_ASSY with BLC/BMC children)
-                                        for parent_key, parent_data in parent_slots.items():
+                                        for (
+                                            parent_key,
+                                            parent_data,
+                                        ) in parent_slots.items():
                                             parent_name = parent_data["parent_name"]
                                             parent_context = parent_data["context_pn"]
                                             parent_info = parent_data["info"]
 
-                                            # Display parent slot (WIRED_ASSY)
                                             if parent_info:
                                                 parent_pns = parent_info["allowed_pns"]
                                                 parent_status = "⚪"
@@ -1025,7 +1394,6 @@ with tab3:
                                                 if len(parent_pns) > 3:
                                                     st.caption(f"  ... +{len(parent_pns) - 3} more PNs")
                                             else:
-                                                # Parent slot exists but no direct rule (only children have rules)
                                                 if parent_context:
                                                     parent_status = "⚪"
                                                     if parent_name in st.session_state.selected_cards_tab3:
@@ -1036,7 +1404,6 @@ with tab3:
                                                 else:
                                                     st.markdown(f"**{parent_name}**")
 
-                                            # Display children slots (BLC, BMC)
                                             for child in parent_data["children"]:
                                                 child_name = child["slot_name"]
                                                 child_pns = child["allowed_pns"]
@@ -1062,7 +1429,6 @@ with tab3:
                                                 if len(child_pns) > 3:
                                                     st.caption(f"   │   ... +{len(child_pns) - 3} more PNs")
 
-                                        # Display non-hierarchical standalone slots
                                         for slot_info in non_hierarchical_slots:
                                             slot_name = slot_info["slot_name"]
                                             pns = slot_info["allowed_pns"]
@@ -1084,7 +1450,9 @@ with tab3:
                                     st.info("No mandatory slots")
 
                     groups_warnings = check_group_constraints_tab3(
-                        st.session_state.selected_cards_tab3, df_slots, selected_lru_tab3
+                        st.session_state.selected_cards_tab3,
+                        df_slots,
+                        selected_lru_tab3,
                     )
                     if groups_warnings:
                         st.markdown("---")
@@ -1093,7 +1461,10 @@ with tab3:
                             st.warning(warning)
 
                     with st.expander("📋 Card Details", expanded=False):
-                        for slot, card_pn in st.session_state.selected_cards_tab3.items():
+                        for (
+                            slot,
+                            card_pn,
+                        ) in st.session_state.selected_cards_tab3.items():
                             card_info = df_slots[
                                 (df_slots["applicable_lru_pn"] == selected_lru_tab3) & (df_slots["new_pn"] == card_pn)
                             ]
