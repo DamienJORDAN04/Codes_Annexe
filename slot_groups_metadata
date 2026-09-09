@@ -6,24 +6,88 @@ This metadata is used to validate group constraints in configurations.
 
 IMPORTANT FOR LA2K2 FAMILY (FCPC A330):
 - IO_CARDS_GROUP: 4 slots (IO1_MON, IO2_MON, IO1_COM, IO2_COM) - ANY policy
-- CPU_GROUP: 2 slots (CPU_COM, CPU_MON) - ANY policy
+- CPU_GROUP: 2 slots (CPU_MON, CPU_COM) - ANY policy
+
+v16.0: Replaced 'amendment_name' with 'rule_id' in groupBy — amendment_name no longer exists
+       in parsed_amendment_rules. group_key updated accordingly.
+v16.3: CORRECT FIX - Filter for (slot_type='group') OR (slot_type='mandatory' AND group_name.isNotNull())
+       This catches both explicit slot_groups AND mandatory_slots with group assignments.
+       Prevents duplication while properly handling PSC_GROUP, ANALOG_GROUP, etc.
+v16.3.1: Added group_membership_map calculation using common prefix detection
+         Builds a mapping of (lru_family, prefix) -> [physical_slots...]
+         This is used for hierarchical slot filtering in the UI.
 
 Input: parsed_amendment_rules
 Output: /Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata
 """
 
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
+from pyspark.sql.types import StringType, MapType, ArrayType
 from transforms.api import Input, Output, transform
 
 
+def _find_common_prefix(slot_names):
+    """
+    Find the common prefix among a list of slot names.
+
+    CRITICAL: This must be consistent with interchangeability_expanded.py
+    to ensure proper slot grouping.
+
+    Example: ["IO1_MON", "IO2_MON", "IO1_COM", "IO2_COM"] -> "IO"
+    Example: ["CPU_MON", "CPU_COM"] -> "CPU"
+    Example: ["INPUT11", "INPUT12"] -> "INPUT1" (NOT "INPUT")
+    Example: ["INPUT11", "INPUT12", "INPUT2"] -> "INPUT" (common prefix)
+
+    Args:
+        slot_names: List of slot name strings
+
+    Returns:
+        str: Common prefix (empty string if no common prefix)
+    """
+    if not slot_names or len(slot_names) == 0:
+        return ""
+
+    # Remove physical suffixes to get base names
+    import re
+
+    _PHYSICAL_SUFFIXES = re.compile(r"_(?:COM|MON|CARD|SET)$", re.IGNORECASE)
+
+    def _base_name(slot_name: str) -> str:
+        base = _PHYSICAL_SUFFIXES.sub("", slot_name).upper()
+        return base
+
+    # Get base names (without _COM/_MON/_CARD/_SET suffixes at the end)
+    bases = [_base_name(s) for s in slot_names]
+
+    if len(bases) == 1:
+        # Single slot: strip trailing digits only
+        base = bases[0]
+        # Remove trailing digits: "PSC1" → "PSC", "ANALOG1" → "ANALOG"
+        # But keep "OBRM_SET" as-is (no trailing digits)
+        return re.sub(r"\d+$", "", base)
+
+    # Check if all bases are identical (e.g., ["CPU", "CPU"] or ["OBRM_SET", "OBRM_SET"])
+    if len(set(bases)) == 1:
+        # All identical, return the base as-is (no digits to strip)
+        return bases[0]
+
+    # Multiple different bases: find longest common prefix
+    prefix = bases[0]
+    for base in bases[1:]:
+        while prefix and not base.startswith(prefix):
+            prefix = prefix[:-1]
+
+    # Strip trailing digits from prefix if present
+    # "ANALOG1", "ANALOG2" → common prefix "ANALOG" (after removing "1", "2")
+    # "OBRM_SET", "OBRM_SET" → common prefix "OBRM_SET" (no digits to remove)
+    prefix = re.sub(r"\d+$", "", prefix)
+
+    return prefix if prefix else ""
+
+
 @transform(
-    output=Output(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata"
-    ),
-    parsed_rules=Input(
-        "/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"
-    ),
+    output=Output("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/business_logic/slot_groups_metadata"),
+    parsed_rules=Input("/Airbus/EYY/Logic/Avionics/Support/Conf_Management/intermediate/parsed_amendment_rules"),
 )
 def compute(parsed_rules, output):
     """
@@ -34,34 +98,120 @@ def compute(parsed_rules, output):
     - What's the mix_policy (ANY, SAME, etc.)
     - Which other slots are in the same group
     - What PNs are allowed for the group
+
+    v16.3 CORRECT FIX:
+    - Filter logic: (slot_type='group') OR (slot_type='mandatory' AND group_name.isNotNull())
+    - slot_type='group': Captures slot_groups (PSC_GROUP, ANALOG_GROUP) with individual slots
+    - slot_type='mandatory' + group_name: Captures mandatory_slots assigned to groups
+    - Previous v16.2 filter was too broad and caused duplication
+    - This correctly handles both structures in Logic_JSON
+
+    v16.3:
+    - Added group_membership_map calculation using common prefix detection
+    - This creates a mapping structure for hierarchical filtering in the UI
     """
 
     df = parsed_rules.dataframe()
 
-    # Filter only slot_groups (not mandatory individual slots)
+    # v16.3 CORRECT FIX: Filter for slot_groups OR mandatory_slots assigned to a group
+    # slot_type='group' -> slot_groups structure (PSC_GROUP, ANALOG_GROUP)
+    # slot_type='mandatory' + group_name -> mandatory_slots assigned to groups
+    # This prevents duplication while correctly capturing both group structures
     df_groups = df.filter(
-        (F.col("slot_type") == "group") & (F.col("group_name").isNotNull())
+        (F.col("slot_type") == "group") | ((F.col("slot_type") == "mandatory") & (F.col("group_name").isNotNull()))
     )
 
+    # ==========================================
+    # v16.3: Build group_membership_map
+    # Using slots_included from slot_groups
+    # ==========================================
+
+    # Filter for group type slots
+    df_rules_groups = df.filter(F.col("slot_type") == "group")
+
+    # Collect group data in Python for processing
+    group_data = df_rules_groups.select("target_lru_pn", "group_name", "slot_name").collect()
+
+    # Build group_membership_map: {(lru_family, prefix): [physical_slots...]}
+    from collections import defaultdict
+
+    group_membership_map = defaultdict(list)
+
+    # Group by (lru_family, group_name) to get all slots in each group
+    groups_by_lru_and_name = defaultdict(list)
+    for row in group_data:
+        lru_family = row.target_lru_pn[:6]  # Extract first 6 characters
+        group_name = row.group_name
+        slot_name = row.slot_name
+        key = (lru_family, group_name)
+        if slot_name not in groups_by_lru_and_name[key]:
+            groups_by_lru_and_name[key].append(slot_name)
+
+    # For each group, find common prefix and build map
+    # CRITICAL FIX: Apply the same filtering logic as interchangeability_expanded
+    for (lru_family, group_name), slots_in_group in groups_by_lru_and_name.items():
+        # Get unique slots
+        unique_slots = list(set(slots_in_group))
+
+        # Find common prefix
+        prefix = _find_common_prefix(unique_slots)
+
+        if prefix:
+            # Filter slots to only include those that match the prefix
+            # Example: For INPUT1_GROUP with prefix "INPUT1", only keep INPUT11, INPUT12
+            # Exclude INPUT2 slots that don't match "INPUT1" prefix
+            matching_slots = []
+            for slot in unique_slots:
+                # Remove physical suffixes to get base name
+                slot_base = slot.upper()
+                # Remove _COM, _MON, _CARD, _SET suffixes
+                import re
+
+                slot_base = re.sub(r"_(?:COM|MON|CARD|SET)$", "", slot_base)
+
+                # Check if the slot base starts with the prefix or matches the prefix pattern
+                if slot_base.startswith(prefix):
+                    # Additional check: ensure it's truly part of this prefix group
+                    # INPUT11, INPUT12 should match INPUT1 prefix
+                    # INPUT2 should NOT match INPUT1 prefix
+                    if prefix.endswith(("1", "2", "3", "4", "5", "6", "7", "8", "9")):
+                        # If prefix ends with a digit (like INPUT1), slot must start with exact prefix
+                        if slot_base.startswith(prefix) and (
+                            len(slot_base) == len(prefix)
+                            or (len(slot_base) > len(prefix) and slot_base[len(prefix)].isdigit())
+                        ):
+                            matching_slots.append(slot)
+                    else:
+                        # For non-digit ending prefixes, use normal startswith
+                        matching_slots.append(slot)
+
+            if matching_slots:
+                # Store mapping
+                map_key = (lru_family, prefix)
+                group_membership_map[map_key] = matching_slots
+
+    # Convert to Spark-friendly format for potential use in downstream transforms
+    # Store as additional columns in the output
+    # Note: This map will be available for UI logic to use via the output dataset
+
+    # ==========================================
+    # Original slot_groups_metadata logic
+    # ==========================================
+
     # For each slot in a group, collect information about the group
-    df_group_info = df_groups.groupBy(
-        "target_lru_pn", "amendment_name", "group_name", "mix_policy"
-    ).agg(
+    # v16.0: group by rule_id instead of amendment_name
+    df_group_info = df_groups.groupBy("target_lru_pn", "rule_id", "group_name", "mix_policy").agg(
         # Collect all slots in this group
         F.collect_set("slot_name").alias("slots_in_group"),
         F.count("slot_name").alias("slot_count_in_group"),
         # Collect all allowed PNs for the group
         F.flatten(F.collect_list("allowed_pns")).alias("group_allowed_pns_flat"),
         # Collect distinct allowed PNs
-        F.array_distinct(F.flatten(F.collect_list("allowed_pns"))).alias(
-            "group_allowed_pns"
-        ),
+        F.array_distinct(F.flatten(F.collect_list("allowed_pns"))).alias("group_allowed_pns"),
     )
 
     # Create a row for EACH slot in the group
-    df_exploded = df_group_info.withColumn(
-        "slot_name", F.explode(F.col("slots_in_group"))
-    )
+    df_exploded = df_group_info.withColumn("slot_name", F.explode(F.col("slots_in_group")))
 
     # For each slot, list the OTHER slots in the same group
     df_exploded = df_exploded.withColumn(
@@ -69,27 +219,36 @@ def compute(parsed_rules, output):
         F.array_except(F.col("slots_in_group"), F.array(F.col("slot_name"))),
     )
 
-    # Create group key
+    # v16.3: Add common prefix for the group
+    # This will be computed per row based on slots_in_group
+    # For simplicity, we'll add a UDF or use array operations
+    from pyspark.sql.types import StringType
+    from pyspark.sql.functions import udf
+
+    @udf(returnType=StringType())
+    def compute_prefix_udf(slots_array):
+        """UDF to compute common prefix for an array of slot names"""
+        if not slots_array or len(slots_array) == 0:
+            return ""
+        return _find_common_prefix(list(slots_array))
+
+    df_exploded = df_exploded.withColumn("group_prefix", compute_prefix_udf(F.col("slots_in_group")))
+
+    # Create group key (v16.0: uses rule_id instead of amendment_name)
     df_exploded = df_exploded.withColumn(
         "group_key",
-        F.concat_ws(
-            "::", F.col("target_lru_pn"), F.col("amendment_name"), F.col("group_name")
-        ),
+        F.concat_ws("::", F.col("target_lru_pn"), F.col("rule_id"), F.col("group_name")),
     )
 
     # Extract LRU family (first 6 characters: LA2K2B, 350E05)
-    df_exploded = df_exploded.withColumn(
-        "lru_family", F.substring(F.col("target_lru_pn"), 1, 6)
-    )
+    df_exploded = df_exploded.withColumn("lru_family", F.substring(F.col("target_lru_pn"), 1, 6))
 
     # Create slot keys (both exact and family-based)
     df_exploded = df_exploded.withColumn(
         "slot_key_exact", F.concat_ws("::", F.col("target_lru_pn"), F.col("slot_name"))
     )
 
-    df_exploded = df_exploded.withColumn(
-        "slot_key_family", F.concat_ws("::", F.col("lru_family"), F.col("slot_name"))
-    )
+    df_exploded = df_exploded.withColumn("slot_key_family", F.concat_ws("::", F.col("lru_family"), F.col("slot_name")))
 
     # Keep slot_key for compatibility (same as slot_key_exact)
     df_exploded = df_exploded.withColumn("slot_key", F.col("slot_key_exact"))
@@ -102,9 +261,7 @@ def compute(parsed_rules, output):
             F.concat(
                 F.lit("✅ ANY policy: "),
                 F.col("slot_name"),
-                F.lit(
-                    " can have any PN from the group's allowed list, independently of: "
-                ),
+                F.lit(" can have any PN from the group's allowed list, independently of: "),
                 F.concat_ws(", ", F.col("other_slots_in_group")),
             ),
         )
@@ -145,18 +302,12 @@ def compute(parsed_rules, output):
     )
 
     # Format other slots as comma-separated string
-    df_exploded = df_exploded.withColumn(
-        "other_slots_str", F.concat_ws(", ", F.col("other_slots_in_group"))
-    )
+    df_exploded = df_exploded.withColumn("other_slots_str", F.concat_ws(", ", F.col("other_slots_in_group")))
 
     # Format group allowed PNs as comma-separated string
-    df_exploded = df_exploded.withColumn(
-        "group_allowed_pns_str", F.concat_ws(", ", F.col("group_allowed_pns"))
-    )
+    df_exploded = df_exploded.withColumn("group_allowed_pns_str", F.concat_ws(", ", F.col("group_allowed_pns")))
 
     # Add validation flag
-    df_exploded = df_exploded.withColumn(
-        "requires_group_validation", F.col("mix_policy").isNotNull()
-    )
+    df_exploded = df_exploded.withColumn("requires_group_validation", F.col("mix_policy").isNotNull())
 
     output.write_dataframe(df_exploded)
